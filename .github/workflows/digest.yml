@@ -1,0 +1,29 @@
+name: MAX Digest
+
+on:
+  schedule:
+    # 08:00 МСК = 05:00 UTC
+    - cron: "0 5 * * *"
+    # 20:00 МСК = 17:00 UTC
+    - cron: "0 17 * * *"
+  workflow_dispatch:  # кнопка «запустить вручную»
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send digest to MAX
+        env:
+          MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+          MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
+        run: python bot.py
