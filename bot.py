@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Режимы:
-  (по умолчанию) — один дайджест (Actions 08:00/20:00)
-  POLL=1         — обработать нажатия кнопок и выйти (Actions каждые 5 мин)
-  LIVE=1         — необязательный long-poll (если есть свой сервер)
+Telegram digest bot.
+
+На хостинге (Railway/Render): LIVE=1 — кнопки сразу.
+GitHub Actions digest: без LIVE — один дайджест и выход.
+GitHub poll (опционально): POLL=1 — редко, если нет хостинга.
 """
 
 from __future__ import annotations
@@ -27,8 +28,15 @@ GEO_LAT = os.environ.get("GEO_LAT", "").strip()
 GEO_LON = os.environ.get("GEO_LON", "").strip()
 GEO_CITY = os.environ.get("GEO_CITY", "").strip()
 GEO_LABEL = os.environ.get("GEO_LABEL", "").strip()
+
+# На Railway/Render обычно задают LIVE=1.
+# Если платформа не передала — но это не Actions digest — тоже можно LIVE.
 LIVE = os.environ.get("LIVE", "").lower() in ("1", "true", "yes")
 POLL = os.environ.get("POLL", "").lower() in ("1", "true", "yes")
+# Авто: если есть PORT или RAILWAY/RENDER — считаем хостингом
+if not LIVE and not POLL:
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER") or os.environ.get("FLY_APP_NAME"):
+        LIVE = True
 
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 ROOT = Path(__file__).resolve().parent
@@ -44,7 +52,7 @@ except Exception:
     TZ = timezone(timedelta(hours=3))
 
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "TgDigestBot/4.0"
+SESSION.headers["User-Agent"] = "TgDigestBot/4.1"
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
 SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
 
@@ -124,7 +132,7 @@ def resolve_geo():
 def block_weather() -> str:
     geo = resolve_geo()
     if not geo:
-        return "🌤 <b>Погода</b>\nТочка не задана. Нажмите «📍 Гео» или Secrets GEO_LAT/GEO_LON"
+        return "🌤 <b>Погода</b>\nТочка не задана. «📍 Гео» или GEO_LAT/GEO_LON / GEO_CITY"
     lat, lon, label = geo
     try:
         r = get(
@@ -383,7 +391,7 @@ KEYBOARD = {
     ],
     "resize_keyboard": True,
     "is_persistent": False,
-    "input_field_placeholder": "Свернуть: ⌄ у поля ввода",
+    "input_field_placeholder": "Свернуть: ⌄",
 }
 
 
@@ -433,7 +441,7 @@ def on_location(chat_id, lat: float, lon: float):
     send(
         chat_id,
         f"📍 Точка: <code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n"
-        f"Добавьте в GitHub Secrets:\nGEO_LAT={lat:.5f}\nGEO_LON={lon:.5f}\n\n"
+        f"На хосте задайте GEO_LAT={lat:.5f} GEO_LON={lon:.5f}\n\n"
         + block_weather(),
     )
 
@@ -446,9 +454,8 @@ def on_text(chat_id, text: str):
         if raw == "/start":
             send(
                 chat_id,
-                "Кнопки внизу. Ответ на нажатие — обычно до 5 минут\n"
-                "(бот проверяет их через GitHub, без телефона).\n"
-                "Автодайджест: 08:00 и 20:00 МСК.",
+                "Бот онлайн. Кнопки отвечают сразу.\n"
+                "Автодайджест (GitHub): 08:00 и 20:00 МСК.",
             )
             send(chat_id, build_digest(True))
             return
@@ -501,11 +508,10 @@ def write_offset(off: int) -> None:
     try:
         OFFSET_FILE.write_text(str(off))
     except Exception as e:
-        print("offset write", e)
+        print("offset", e)
 
 
 def process_updates(long_poll: bool = False) -> int:
-    """Обработать апдейты. long_poll=False — сразу выйти (для Actions)."""
     if not BOT_TOKEN:
         print("no token")
         return 0
@@ -516,8 +522,8 @@ def process_updates(long_poll: bool = False) -> int:
 
     offset = read_offset()
     handled = 0
-    timeout = 20 if long_poll else 0
-    http_to = (3, 30) if long_poll else (2, 8)
+    timeout = 25 if long_poll else 0
+    http_to = (5, 35) if long_poll else (2, 8)
 
     try:
         r = SESSION.get(
@@ -526,6 +532,8 @@ def process_updates(long_poll: bool = False) -> int:
             timeout=http_to,
         )
         data = r.json()
+    except requests.exceptions.ReadTimeout:
+        return 0
     except Exception as e:
         print("getUpdates", type(e).__name__, e)
         return 0
@@ -541,7 +549,6 @@ def process_updates(long_poll: bool = False) -> int:
             continue
         cid = msg["chat"]["id"]
         if CHAT_ID and str(cid) != str(CHAT_ID).strip():
-            print("skip", cid)
             continue
         if "location" in msg:
             loc = msg["location"]
@@ -552,18 +559,22 @@ def process_updates(long_poll: bool = False) -> int:
             handled += 1
 
     write_offset(offset)
-    print(f"processed={handled} offset={offset}")
+    if handled:
+        print(f"processed={handled} offset={offset}")
     return handled
 
 
 def run_live():
-    print("LIVE long-poll (optional)")
+    print("LIVE — кнопки онлайн (как finance-bot)")
+    fail = 0
     while True:
         try:
             process_updates(long_poll=True)
+            fail = 0
         except Exception as e:
+            fail += 1
             print("live", type(e).__name__, e)
-            time.sleep(3)
+            time.sleep(min(30, 2 * fail))
 
 
 def main():
@@ -571,7 +582,7 @@ def main():
         run_live()
         return
     if POLL:
-        print("POLL mode — buttons via GitHub Actions")
+        print("POLL")
         process_updates(long_poll=False)
         return
 

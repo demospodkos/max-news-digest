@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: tg-digest-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    envVars:
+      - key: LIVE
+        value: "1"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: GEO_LAT
+        sync: false
+      - key: GEO_LON
+        sync: false
+      - key: GEO_CITY
+        sync: false
