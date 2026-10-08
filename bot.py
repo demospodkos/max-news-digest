@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
 """
-Дайджест + интерактивный бот с кнопками → Telegram.
+Дайджест + кнопки + геолокация из Telegram.
 
-Режимы:
-  ONCE=1 или без LIVE  — один дайджест (GitHub Actions)
-  LIVE=1               — кнопки и команды (нужен постоянно работающий процесс: Termux)
+GEO_MODE:
+  auto     — 1) geo.json / точка из Telegram  2) GEO_LAT/LON  3) GEO_CITY  4) IP (только Termux)
+  telegram — только сохранённая точка
+  city     — GEO_CITY / GEO_LAT+LON
+  ip       — по IP (на Actions даст погоду дата-центра — не используйте там)
+
+Режимы запуска:
+  (по умолчанию) — один дайджест (GitHub Actions)
+  LIVE=1         — кнопки + приём геопозиции (Termux)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-# Погода по координатам (Крайний Север — ваши широта/долгота)
+GEO_MODE = (os.environ.get("GEO_MODE") or "auto").lower()
 GEO_LAT = os.environ.get("GEO_LAT", "")
 GEO_LON = os.environ.get("GEO_LON", "")
-GEO_CITY = os.environ.get("GEO_CITY", "")  # если задан город — координаты подставятся сами
-GEO_LABEL = os.environ.get("GEO_LABEL", "")  # подпись: «Мурманск», «ЯНАО»
+GEO_CITY = os.environ.get("GEO_CITY", "")
+GEO_LABEL = os.environ.get("GEO_LABEL", "")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TZ = ZoneInfo("Europe/Moscow")
+ROOT = Path(__file__).resolve().parent
+GEO_FILE = ROOT / "geo.json"
 
 RSS_FEEDS = {
     "Интерфакс": "https://www.interfax.ru/rss",
@@ -35,9 +45,8 @@ RSS_FEEDS = {
 STOCKS = ["SBER", "GAZP", "LKOH", "ROSN", "GMKN", "VTBR", "MTSS"]
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TgDigestBot/2.0"})
+SESSION.headers.update({"User-Agent": "TgDigestBot/2.1"})
 
-# Кнопки меню
 BTN_DIGEST = "📊 Дайджест"
 BTN_WEATHER = "🌤 Погода"
 BTN_RATES = "💱 Курсы"
@@ -45,13 +54,14 @@ BTN_CRYPTO = "₿ Крипта"
 BTN_KP = "🧲 Магн. бури"
 BTN_NEWS = "📰 Новости"
 BTN_SHORT = "⚡ Кратко"
+BTN_GEO = "📍 Моя точка"
 
 KEYBOARD = {
     "keyboard": [
         [{"text": BTN_DIGEST}, {"text": BTN_SHORT}],
         [{"text": BTN_WEATHER}, {"text": BTN_KP}],
         [{"text": BTN_RATES}, {"text": BTN_CRYPTO}],
-        [{"text": BTN_NEWS}],
+        [{"text": BTN_NEWS}, {"text": BTN_GEO}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -59,45 +69,129 @@ KEYBOARD = {
 
 
 def esc(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
-def resolve_geo() -> tuple[float, float, str] | None:
-    """Вернуть (lat, lon, label) из env."""
-    if GEO_LAT and GEO_LON:
-        try:
-            lat, lon = float(GEO_LAT), float(GEO_LON)
-            label = GEO_LABEL or f"{lat:.2f},{lon:.2f}"
-            return lat, lon, label
-        except ValueError:
-            pass
-    if GEO_CITY:
-        try:
-            r = SESSION.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": GEO_CITY, "count": 1, "language": "ru", "format": "json"},
-                timeout=15,
-            )
-            results = r.json().get("results") or []
-            if results:
-                p = results[0]
-                label = GEO_LABEL or p.get("name") or GEO_CITY
-                return float(p["latitude"]), float(p["longitude"]), label
-        except Exception as e:
-            print("geocode error:", e)
+# ─── Гео: сохранение / загрузка ─────────────────────────────────────────────
+def load_geo_file() -> dict | None:
+    if not GEO_FILE.exists():
+        return None
+    try:
+        data = json.loads(GEO_FILE.read_text(encoding="utf-8"))
+        if "lat" in data and "lon" in data:
+            return data
+    except Exception as e:
+        print("geo.json read error:", e)
     return None
 
 
+def save_geo_file(lat: float, lon: float, label: str = "", source: str = "telegram") -> None:
+    payload = {
+        "lat": lat,
+        "lon": lon,
+        "label": label or f"{lat:.4f},{lon:.4f}",
+        "source": source,
+        "updated_at": datetime.now(TZ).isoformat(timespec="seconds"),
+    }
+    GEO_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("geo saved:", payload)
+
+
+def geo_from_ip() -> tuple[float, float, str] | None:
+    """Только для Termux/телефона. На GitHub Actions вернёт США/Европу — не для Actions."""
+    try:
+        r = SESSION.get("https://ipapi.co/json/", timeout=10)
+        d = r.json()
+        if d.get("latitude") is not None and d.get("longitude") is not None:
+            label = d.get("city") or d.get("region") or "IP"
+            return float(d["latitude"]), float(d["longitude"]), str(label)
+    except Exception as e:
+        print("ip geo error:", e)
+    try:
+        r = SESSION.get("https://ipinfo.io/json", timeout=10)
+        d = r.json()
+        loc = (d.get("loc") or "").split(",")
+        if len(loc) == 2:
+            return float(loc[0]), float(loc[1]), d.get("city") or "IP"
+    except Exception as e:
+        print("ipinfo error:", e)
+    return None
+
+
+def geo_from_city(name: str) -> tuple[float, float, str] | None:
+    try:
+        r = SESSION.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": name, "count": 1, "language": "ru", "format": "json"},
+            timeout=15,
+        )
+        results = r.json().get("results") or []
+        if results:
+            p = results[0]
+            label = GEO_LABEL or p.get("name") or name
+            return float(p["latitude"]), float(p["longitude"]), label
+    except Exception as e:
+        print("geocode error:", e)
+    return None
+
+
+def resolve_geo() -> tuple[float, float, str] | None:
+    """
+    Приоритет (auto):
+      1. geo.json (точка из Telegram)
+      2. GEO_LAT + GEO_LON
+      3. GEO_CITY
+      4. IP — только если GEO_MODE=ip или auto и похоже на не-Actions
+    """
+    mode = GEO_MODE
+
+    if mode in ("auto", "telegram"):
+        saved = load_geo_file()
+        if saved:
+            return float(saved["lat"]), float(saved["lon"]), saved.get("label") or "Telegram"
+
+    if mode in ("auto", "city", "telegram"):
+        if GEO_LAT and GEO_LON:
+            try:
+                lat, lon = float(GEO_LAT), float(GEO_LON)
+                return lat, lon, GEO_LABEL or f"{lat:.2f},{lon:.2f}"
+            except ValueError:
+                pass
+        if GEO_CITY:
+            g = geo_from_city(GEO_CITY)
+            if g:
+                return g
+
+    if mode == "ip" or (mode == "auto" and os.environ.get("LIVE")):
+        g = geo_from_ip()
+        if g:
+            return g
+
+    # запас для Actions без точки
+    if GEO_CITY:
+        return geo_from_city(GEO_CITY)
+    return None
+
+
+# ─── Блоки данных ───────────────────────────────────────────────────────────
 def get_weather() -> str:
     geo = resolve_geo()
     if not geo:
         return (
             "🌤 <b>Погода</b>\n"
-            "Не заданы координаты.\n"
-            "В Secrets добавьте:\n"
-            "• <code>GEO_LAT</code> и <code>GEO_LON</code>\n"
-            "  или <code>GEO_CITY</code> (например Murmansk)\n"
-            "• опционально <code>GEO_LABEL</code> — название места"
+            "Точка не задана.\n\n"
+            "<b>Как задать (рекомендуется):</b>\n"
+            "1. Запустите бота в Termux: <code>LIVE=1 python bot.py</code>\n"
+            "2. В Telegram: скрепка → Геопозиция → отправьте точку\n"
+            "3. Бот сохранит её в geo.json\n\n"
+            "Или в GitHub Secrets:\n"
+            "• <code>GEO_LAT</code> + <code>GEO_LON</code>\n"
+            "• или <code>GEO_CITY</code>=Murmansk"
         )
     lat, lon, label = geo
     try:
@@ -106,8 +200,10 @@ def get_weather() -> str:
             params={
                 "latitude": lat,
                 "longitude": lon,
-                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
-                "wind_speed_10m,wind_gusts_10m,weather_code,visibility",
+                "current": (
+                    "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                    "wind_speed_10m,wind_gusts_10m,weather_code,visibility"
+                ),
                 "daily": "sunrise,sunset,daylight_duration",
                 "timezone": "Europe/Moscow",
                 "forecast_days": 1,
@@ -136,7 +232,10 @@ def get_weather() -> str:
                 85: "снегопад",
                 95: "гроза",
             }
-            return table.get(int(c) if c is not None else -1, f"код {c}")
+            try:
+                return table.get(int(c), f"код {c}")
+            except (TypeError, ValueError):
+                return "—"
 
         t = cur.get("temperature_2m")
         feels = cur.get("apparent_temperature")
@@ -153,30 +252,28 @@ def get_weather() -> str:
             sunset = sunset.split("T")[1][:5]
         daylen = (daily.get("daylight_duration") or [None])[0]
         day_h = f"{daylen/3600:.1f} ч" if daylen else "—"
-
         vis_km = f"{vis/1000:.1f} км" if vis is not None else "—"
-        lines = [
+
+        return "\n".join([
             f"🌤 <b>Погода — {esc(label)}</b>",
-            f"{wcode(code)}",
+            f"📍 {lat:.4f}, {lon:.4f}",
+            wcode(code),
             f"Темп: {t}°C (ощущ. {feels}°C)",
             f"Ветер: {wind} м/с, порывы {gust} м/с",
             f"Влажность: {hum}% · видимость: {vis_km}",
             f"Восход {sunrise} · закат {sunset} · день {day_h}",
-        ]
-        return "\n".join(lines)
+        ])
     except Exception as e:
         return f"🌤 Погода\nошибка: {e}"
 
 
 def get_kp() -> str:
-    """Магнитные бури — NOAA planetary K-index."""
     try:
         r = SESSION.get(
             "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json",
             timeout=15,
         )
         rows = r.json()
-        # [time_tag, kp, a_running, station_count]
         if len(rows) < 2:
             return "🧲 Магн. бури\nнет данных"
         last = rows[-1]
@@ -223,47 +320,6 @@ def get_currencies() -> str:
         return f"💱 Курсы\nошибка: {e}"
 
 
-def get_key_rate() -> str:
-    """Ключевая ставка ЦБ — последний известный из публичного источника."""
-    try:
-        # MOEX / CBR key rate via cbr.ru XML is heavy; use simple fallback page parse skip
-        # Use ISS indicator if available
-        r = SESSION.get(
-            "https://iss.moex.com/iss/engines/stock/markets/index/securities/RGBI.json",
-            params={"iss.meta": "off"},
-            timeout=15,
-        )
-        # Better: known official JSON mirrors often break; keep compact note
-        return "🏦 <b>Ставка ЦБ</b>\nсм. cbr.ru (меняется редко, раз в дайджест — вручную при смене)"
-    except Exception:
-        return "🏦 Ставка ЦБ\n—"
-
-
-def get_oil() -> str:
-    try:
-        # Free approximate via public endpoints; CoinGecko doesn't have oil.
-        # Use oilpriceapi free? needs key. Use Yahoo-like or skip.
-        # MOEX BR oil futures if available
-        r = SESSION.get(
-            "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json",
-            params={"iss.meta": "off", "iss.only": "securities"},
-            timeout=20,
-        )
-        data = r.json()
-        cols = data.get("securities", {}).get("columns", [])
-        rows = data.get("securities", {}).get("data", [])
-        if "SECID" in cols and "PREVSETTLEPRICE" in cols:
-            i_id = cols.index("SECID")
-            i_p = cols.index("PREVSETTLEPRICE")
-            for row in rows:
-                sid = str(row[i_id])
-                if sid.startswith("BR") and row[i_p]:
-                    return f"🛢 <b>Нефть</b> (фьюч. {sid})\n{row[i_p]} USD"
-        return "🛢 Нефть\nданные временно недоступны"
-    except Exception as e:
-        return f"🛢 Нефть\nошибка: {e}"
-
-
 def get_crypto() -> str:
     try:
         r = SESSION.get(
@@ -276,14 +332,13 @@ def get_crypto() -> str:
         )
         data = r.json()
         lines = ["₿ <b>Криптовалюты</b>"]
-        mapping = [
+        for key, name in [
             ("bitcoin", "BTC"),
             ("ethereum", "ETH"),
             ("tether", "USDT"),
             ("the-open-network", "TON"),
             ("solana", "SOL"),
-        ]
-        for key, name in mapping:
+        ]:
             if key in data:
                 d = data[key]
                 lines.append(f"{name}: ${d.get('usd', 0):,.2f} / {d.get('rub', 0):,.0f} ₽")
@@ -323,6 +378,28 @@ def get_precious_metals() -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"🥇 Драгметаллы\nошибка: {e}"
+
+
+def get_oil() -> str:
+    try:
+        r = SESSION.get(
+            "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json",
+            params={"iss.meta": "off", "iss.only": "securities"},
+            timeout=20,
+        )
+        data = r.json()
+        cols = data.get("securities", {}).get("columns", [])
+        rows = data.get("securities", {}).get("data", [])
+        if "SECID" in cols and "PREVSETTLEPRICE" in cols:
+            i_id = cols.index("SECID")
+            i_p = cols.index("PREVSETTLEPRICE")
+            for row in rows:
+                sid = str(row[i_id])
+                if sid.startswith("BR") and row[i_p]:
+                    return f"🛢 <b>Нефть</b> (фьюч. {sid})\n{row[i_p]} USD"
+        return "🛢 Нефть\nданные временно недоступны"
+    except Exception as e:
+        return f"🛢 Нефть\nошибка: {e}"
 
 
 def get_stocks() -> str:
@@ -378,7 +455,7 @@ def get_news(limit: int = 40) -> str:
                     items.append((source, t))
         except Exception:
             pass
-    seen = set()
+    seen: set[str] = set()
     unique = []
     for src, title in items:
         key = title.lower()[:80]
@@ -395,7 +472,6 @@ def get_news(limit: int = 40) -> str:
 
 
 def get_short_summary() -> str:
-    """Одна строка-сводка в начале."""
     parts = []
     try:
         v = SESSION.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=10).json()["Valute"]
@@ -416,16 +492,20 @@ def get_short_summary() -> str:
     if geo:
         try:
             lat, lon, label = geo
-            w = SESSION.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "current": "temperature_2m,wind_speed_10m",
-                    "timezone": "Europe/Moscow",
-                },
-                timeout=10,
-            ).json().get("current", {})
+            w = (
+                SESSION.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": lat,
+                        "longitude": lon,
+                        "current": "temperature_2m,wind_speed_10m",
+                        "timezone": "Europe/Moscow",
+                    },
+                    timeout=10,
+                )
+                .json()
+                .get("current", {})
+            )
             parts.append(f"{label} {w.get('temperature_2m')}°C ветер {w.get('wind_speed_10m')}м/с")
         except Exception:
             pass
@@ -443,7 +523,7 @@ def build_digest(full: bool = True) -> str:
             get_currencies(),
             get_crypto(),
         ])
-    parts = [
+    return "\n\n".join([
         f"📊 <b>Дайджест на {now}</b> (МСК)",
         get_short_summary(),
         get_weather(),
@@ -454,12 +534,32 @@ def build_digest(full: bool = True) -> str:
         get_oil(),
         get_stocks(),
         get_news(40),
-    ]
-    return "\n\n".join(parts)
+    ])
 
 
-def tg_api(method: str, payload: dict) -> dict:
-    r = SESSION.post(f"{TG_API}/{method}", json=payload, timeout=30)
+def geo_status_text() -> str:
+    g = resolve_geo()
+    saved = load_geo_file()
+    lines = ["📍 <b>Геоточка</b>"]
+    if g:
+        lines.append(f"Сейчас для погоды: {esc(g[2])}")
+        lines.append(f"{g[0]:.4f}, {g[1]:.4f}")
+    else:
+        lines.append("не задана")
+    if saved:
+        lines.append(f"Файл geo.json: {saved.get('updated_at', '—')} ({saved.get('source')})")
+    lines.append("")
+    lines.append("Чтобы задать: скрепка → <b>Геопозиция</b> → отправить точку.")
+    lines.append("Для Actions после сохранения скопируйте lat/lon в Secrets GEO_LAT / GEO_LON.")
+    return "\n".join(lines)
+
+
+# ─── Telegram API ───────────────────────────────────────────────────────────
+def tg_api(method: str, payload: dict | None = None, params: dict | None = None) -> dict:
+    if payload is not None:
+        r = SESSION.post(f"{TG_API}/{method}", json=payload, timeout=30)
+    else:
+        r = SESSION.get(f"{TG_API}/{method}", params=params or {}, timeout=60)
     return r.json()
 
 
@@ -478,7 +578,7 @@ def send_message(chat_id: str | int, text: str, with_keyboard: bool = False) -> 
 
     ok = True
     for i, chunk in enumerate(chunks):
-        body = {
+        body: dict = {
             "chat_id": chat_id,
             "text": chunk,
             "parse_mode": "HTML",
@@ -486,7 +586,7 @@ def send_message(chat_id: str | int, text: str, with_keyboard: bool = False) -> 
         }
         if with_keyboard and i == len(chunks) - 1:
             body["reply_markup"] = KEYBOARD
-        data = tg_api("sendMessage", body)
+        data = tg_api("sendMessage", payload=body)
         print(f"send {i+1}/{len(chunks)}: ok={data.get('ok')}")
         if not data.get("ok"):
             print(data)
@@ -494,17 +594,39 @@ def send_message(chat_id: str | int, text: str, with_keyboard: bool = False) -> 
     return ok
 
 
+def handle_location(chat_id: int, lat: float, lon: float) -> None:
+    # подпись через reverse geocode open-meteo (если есть)
+    label = f"{lat:.4f},{lon:.4f}"
+    try:
+        # нет официального reverse в open-meteo free — оставим координаты
+        pass
+    except Exception:
+        pass
+    save_geo_file(lat, lon, label=label, source="telegram")
+    send_message(
+        chat_id,
+        f"📍 <b>Точка сохранена</b>\n"
+        f"{lat:.5f}, {lon:.5f}\n\n"
+        f"Погода будет для этой точки.\n"
+        f"Для GitHub Actions добавьте Secrets:\n"
+        f"<code>GEO_LAT</code> = <code>{lat:.5f}</code>\n"
+        f"<code>GEO_LON</code> = <code>{lon:.5f}</code>\n\n"
+        + get_weather(),
+        with_keyboard=True,
+    )
+
+
 def handle_text(chat_id: int, text: str) -> None:
     t = (text or "").strip()
     low = t.lower()
 
-    if t in (BTN_DIGEST, "/now", "/digest", "/start") or low in ("дайджест",):
+    if t in (BTN_DIGEST, "/now", "/digest", "/start") or low == "дайджест":
         if t == "/start":
             send_message(
                 chat_id,
-                "Привет! Кнопки ниже — быстрый доступ.\n"
-                "Расписание: 08:00 и 20:00 МСК (через GitHub Actions).\n"
-                "Погода берётся по вашим координатам из настроек.",
+                "Привет! Кнопки внизу.\n"
+                "📍 Геоточку: скрепка → Геопозиция.\n"
+                "Расписание дайджеста: 08:00 и 20:00 МСК.",
                 with_keyboard=True,
             )
         send_message(chat_id, build_digest(True), with_keyboard=True)
@@ -520,39 +642,29 @@ def handle_text(chat_id: int, text: str) -> None:
         send_message(chat_id, get_kp(), with_keyboard=True)
     elif t in (BTN_NEWS, "/news") or low == "новости":
         send_message(chat_id, get_news(25), with_keyboard=True)
-    elif low.startswith("/geo"):
-        send_message(
-            chat_id,
-            "Геоточка задаётся в GitHub Secrets:\n"
-            "<code>GEO_LAT</code>, <code>GEO_LON</code>\n"
-            "или <code>GEO_CITY</code>=Murmansk\n"
-            f"Сейчас: LAT={GEO_LAT or '—'} LON={GEO_LON or '—'} CITY={GEO_CITY or '—'}",
-            with_keyboard=True,
-        )
+    elif t in (BTN_GEO, "/geo") or "точк" in low:
+        send_message(chat_id, geo_status_text(), with_keyboard=True)
     else:
         send_message(
             chat_id,
-            "Команды: /now /weather /rates /crypto /kp /news /short\nили кнопки внизу.",
+            "Команды: /now /weather /rates /crypto /kp /news /short /geo\n"
+            "Или кнопки. Геоточку — скрепкой.",
             with_keyboard=True,
         )
 
 
 def run_live() -> None:
-    """Long polling — кнопки работают. Нужен постоянно включённый процесс (Termux)."""
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN не задан")
-    print("LIVE mode: long polling…")
+    print("LIVE mode: long polling (кнопки + геопозиция)…")
     offset = 0
-    # сброс webhook на всякий случай
-    tg_api("deleteWebhook", {})
+    tg_api("deleteWebhook", payload={})
     while True:
         try:
-            r = SESSION.get(
-                f"{TG_API}/getUpdates",
+            data = tg_api(
+                "getUpdates",
                 params={"timeout": 50, "offset": offset},
-                timeout=60,
             )
-            data = r.json()
             if not data.get("ok"):
                 print("getUpdates error", data)
                 time.sleep(3)
@@ -563,11 +675,15 @@ def run_live() -> None:
                 if not msg:
                     continue
                 chat_id = msg["chat"]["id"]
-                text = msg.get("text") or ""
-                # опционально: только ваш chat
                 if CHAT_ID and str(chat_id) != str(CHAT_ID):
                     continue
-                handle_text(chat_id, text)
+                if "location" in msg:
+                    loc = msg["location"]
+                    handle_location(chat_id, float(loc["latitude"]), float(loc["longitude"]))
+                    continue
+                text = msg.get("text") or ""
+                if text:
+                    handle_text(chat_id, text)
         except Exception as e:
             print("live loop error:", e)
             time.sleep(5)

@@ -1,82 +1,54 @@
-# Дайджест + кнопки → Telegram
+# Дайджест → Telegram + погода по геоточке
 
-**Два режима:**
+## Геолокация (вариант 3 — Telegram)
 
-| Режим | Что делает | Где работает |
-|--------|------------|-------------|
-| Расписание | Полный дайджест 08:00 и 20:00 МСК | GitHub Actions (уже настроено) |
-| Кнопки / команды | Ответ сразу на нажатие | Нужен **постоянный** процесс (Termux на телефоне) |
+**Самый точный способ:**
 
-GitHub Actions **не держит** бота онлайн 24/7 — поэтому кнопки «вживую» только через Termux (или любой VPS).
+1. Запустите бота в **Termux** (`LIVE=1 python bot.py`)
+2. В чате с ботом: **скрепка → Геопозиция** → отправьте точку
+3. Бот сохранит её в `geo.json` и сразу пришлёт погоду
 
----
+Для **GitHub Actions** после этого добавьте в Secrets координаты, которые бот пришлёт в ответе:
+- `GEO_LAT`
+- `GEO_LON`
 
-## Уже в дайджесте
+На Actions **нельзя** брать погоду по IP раннера — получите Амстердам/США, не Мурманск.
 
-- ⚡ Краткая сводка (USD/EUR/BTC + погода)
-- 🌤 **Погода по геоточке** (Open-Meteo, без ключа)
-- 🧲 Магнитные бури (Kp, NOAA)
-- 💱 Курсы ЦБ, ₿ крипта (BTC ETH USDT TON SOL)
-- 🥇 Драгметаллы, 🛢 нефть, 📈 акции, 📰 40 новостей
-- Клавиатура-кнопки приходит **вместе с дайджестом**
+### Режимы `GEO_MODE`
 
----
-
-## Погода по геотегу
-
-В GitHub → **Settings → Secrets and variables → Actions** добавьте:
-
-**Вариант A — координаты (точнее для Севера):**
-- `GEO_LAT` = `68.96`  (пример: Мурманск)
-- `GEO_LON` = `33.08`
-- `GEO_LABEL` = `Мурманск` (необязательно)
-
-**Вариант B — город:**
-- `GEO_CITY` = `Murmansk` или `Norilsk` или `Salekhard`
-
-Узнать координаты: карты Google/Яндекс → точка → широта, долгота.
-
-После добавления секретов снова **Run workflow** — в дайджесте появится погода.
+| Режим | Поведение |
+|--------|-----------|
+| `auto` (по умолчанию) | geo.json → Secrets LAT/LON → GEO_CITY → IP только в LIVE |
+| `telegram` | только сохранённая точка / Secrets |
+| `city` | GEO_CITY или LAT/LON |
+| `ip` | только IP (только Termux!) |
 
 ---
 
-## Кнопки (Termux на Android)
+## Кнопки
 
-1. Установите [Termux](https://f-droid.org/packages/com.termux/) с F-Droid  
-2. В Termux:
+Работают в **LIVE**-режиме (Termux):
+
+📊 Дайджест · ⚡ Кратко · 🌤 Погода · 🧲 Магн. бури · 💱 Курсы · ₿ Крипта · 📰 Новости · 📍 Моя точка
+
 ```bash
-pkg update && pkg install python git
+pkg install python git
 pip install requests
 git clone https://github.com/demospodkos/max-news-digest.git
 cd max-news-digest
-export TELEGRAM_BOT_TOKEN='ваш_токен'
-export TELEGRAM_CHAT_ID='ваш_id'
-export GEO_LAT='68.96'
-export GEO_LON='33.08'
-export GEO_LABEL='Мурманск'
+export TELEGRAM_BOT_TOKEN='...'
+export TELEGRAM_CHAT_ID='...'
 LIVE=1 python bot.py
 ```
-3. В Telegram нажмите `/start` — появятся кнопки:
-   - 📊 Дайджест · ⚡ Кратко
-   - 🌤 Погода · 🧲 Магн. бури
-   - 💱 Курсы · ₿ Крипта
-   - 📰 Новости
-
-Чтобы не гасло: `pkg install termux-services` и держите сессию, или запускайте в `tmux`.
 
 ---
 
-## Секреты GitHub (обязательные)
+## GitHub Actions (08:00 и 20:00 МСК)
 
-| Secret | Значение |
-|--------|----------|
-| `TELEGRAM_BOT_TOKEN` | токен от @BotFather |
-| `TELEGRAM_CHAT_ID` | ваш числовой id |
-| `GEO_LAT` / `GEO_LON` или `GEO_CITY` | точка для погоды |
-| `GEO_LABEL` | подпись места (опционально) |
+Secrets:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `GEO_LAT` + `GEO_LON` (после отправки точки боту)
+- опционально `GEO_LABEL`, `GEO_CITY`
 
----
-
-## Расписание Actions
-
-08:00 и 20:00 МСК. Ручной запуск: Actions → Telegram Digest → Run workflow.
+Actions → Telegram Digest → Run workflow — ручная проверка.
