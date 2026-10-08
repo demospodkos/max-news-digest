@@ -1,4 +1,4 @@
-name: MAX Digest
+name: Telegram Digest
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
     - cron: "0 5 * * *"
     # 20:00 МСК = 17:00 UTC
     - cron: "0 17 * * *"
-  workflow_dispatch:  # кнопка «запустить вручную»
+  workflow_dispatch:
 
 jobs:
   send:
@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Send digest to MAX
+      - name: Send digest to Telegram
         env:
-          MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
-          MAX_CHAT_ID: ${{ secrets.MAX_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py

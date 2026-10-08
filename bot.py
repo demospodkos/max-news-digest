@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Дайджест новостей и курсов для MAX.
+Дайджест новостей и курсов → Telegram.
 Запускается через GitHub Actions 2 раза в сутки (08:00 и 20:00 МСК).
 """
 
@@ -13,9 +13,9 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("MAX_CHAT_ID", "")
-MAX_API_BASE = "https://platform-api2.max.ru"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TZ = ZoneInfo("Europe/Moscow")
 
 RSS_FEEDS = {
@@ -24,14 +24,14 @@ RSS_FEEDS = {
 }
 STOCKS = ["SBER", "GAZP", "LKOH", "ROSN", "GMKN", "VTBR", "MTSS"]
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "MaxDigestBot/1.0"})
+SESSION.headers.update({"User-Agent": "TgDigestBot/1.0"})
 
 
 def get_currencies() -> str:
     try:
         data = SESSION.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=15).json()
         v = data["Valute"]
-        lines = ["💱 Курсы валют ЦБ РФ"]
+        lines = ["💱 <b>Курсы валют ЦБ РФ</b>"]
         for code in ("USD", "EUR", "CNY"):
             if code in v:
                 val = v[code]["Value"]
@@ -52,7 +52,7 @@ def get_crypto() -> str:
             timeout=15,
         )
         data = r.json()
-        lines = ["₿ Криптовалюты"]
+        lines = ["₿ <b>Криптовалюты</b>"]
         if "bitcoin" in data:
             b = data["bitcoin"]
             lines.append(f"BTC: ${b.get('usd', 0):,.0f} / {b.get('rub', 0):,.0f} ₽")
@@ -88,7 +88,7 @@ def get_precious_metals() -> str:
                 pass
         if not latest:
             return "🥇 Драгметаллы\nнедоступны"
-        lines = ["🥇 Драгметаллы (ЦБ, ₽/г)"]
+        lines = ["🥇 <b>Драгметаллы</b> (ЦБ, ₽/г)"]
         for code, name in codes.items():
             if code in latest:
                 lines.append(f"{name}: {latest[code]:,.2f}".replace(",", " "))
@@ -117,7 +117,7 @@ def get_stocks() -> str:
         idx_id = cols.index("SECID") if "SECID" in cols else 0
         idx_last = cols.index("LAST") if "LAST" in cols else None
         idx_chg = cols.index("LASTTOPREVPRICE") if "LASTTOPREVPRICE" in cols else None
-        lines = ["📈 Акции (Мосбиржа)"]
+        lines = ["📈 <b>Акции</b> (Мосбиржа)"]
         for row in rows:
             sid = row[idx_id]
             last = row[idx_last] if idx_last is not None else None
@@ -144,8 +144,8 @@ def get_news(limit: int = 40) -> str:
                 text,
                 re.DOTALL | re.IGNORECASE,
             )
-            for t in titles[1:16]:  # skip channel title
-                t = t.strip()
+            for t in titles[1:16]:
+                t = re.sub(r"<[^>]+>", "", t).strip()
                 if t:
                     items.append((source, t))
         except Exception:
@@ -160,8 +160,10 @@ def get_news(limit: int = 40) -> str:
     unique = unique[:limit]
     if not unique:
         return "📰 Новости\nне удалось получить"
-    lines = [f"📰 Новости ({len(unique)})"]
+    lines = [f"📰 <b>Новости</b> ({len(unique)})"]
     for i, (src, title) in enumerate(unique, 1):
+        # экранируем HTML
+        title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         lines.append(f"{i}. [{src}] {title}")
     return "\n".join(lines)
 
@@ -169,7 +171,7 @@ def get_news(limit: int = 40) -> str:
 def build_digest() -> str:
     now = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
     parts = [
-        f"📊 Дайджест на {now} (МСК)",
+        f"📊 <b>Дайджест на {now}</b> (МСК)",
         "",
         get_currencies(),
         "",
@@ -184,13 +186,14 @@ def build_digest() -> str:
     return "\n".join(parts).strip()
 
 
-def send_to_max(text: str) -> bool:
+def send_to_telegram(text: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
-        print("MAX_BOT_TOKEN или MAX_CHAT_ID не заданы")
+        print("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы")
         print(text)
         return False
 
-    MAX_LEN = 3500
+    # Telegram limit ~4096 символов
+    MAX_LEN = 4000
     chunks = []
     while text:
         if len(text) <= MAX_LEN:
@@ -202,26 +205,23 @@ def send_to_max(text: str) -> bool:
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
 
-    headers = {
-        "Authorization": BOT_TOKEN,
-        "Content-Type": "application/json",
-    }
     ok = True
     for i, chunk in enumerate(chunks):
-        payload = {
-            "chat_id": int(CHAT_ID) if str(CHAT_ID).isdigit() else CHAT_ID,
-            "text": chunk,
-        }
         try:
             r = SESSION.post(
-                f"{MAX_API_BASE}/messages",
-                json=payload,
-                headers=headers,
+                f"{TG_API}/sendMessage",
+                json={
+                    "chat_id": CHAT_ID,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
                 timeout=20,
             )
-            print(f"часть {i+1}/{len(chunks)}: HTTP {r.status_code}")
-            if r.status_code not in (200, 201):
-                print(r.text[:300])
+            data = r.json()
+            print(f"часть {i+1}/{len(chunks)}: ok={data.get('ok')} status={r.status_code}")
+            if not data.get("ok"):
+                print(data)
                 ok = False
         except Exception as e:
             print("send error:", e)
@@ -233,7 +233,7 @@ def main():
     print("Собираю дайджест...")
     text = build_digest()
     print(f"Длина: {len(text)} символов")
-    ok = send_to_max(text)
+    ok = send_to_telegram(text)
     print("OK" if ok else "FAILED")
     if not ok:
         raise SystemExit(1)
