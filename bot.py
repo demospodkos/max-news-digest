@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Дайджест + кнопки + геолокация → Telegram. Не зависает на API."""
+# -*- coding: utf-8 -*-
+"""Telegram digest bot — hard timeouts, never hangs."""
 
 from __future__ import annotations
 
@@ -7,603 +8,531 @@ import json
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-GEO_MODE = (os.environ.get("GEO_MODE") or "auto").lower()
-GEO_LAT = os.environ.get("GEO_LAT", "")
-GEO_LON = os.environ.get("GEO_LON", "")
-GEO_CITY = os.environ.get("GEO_CITY", "")
-GEO_LABEL = os.environ.get("GEO_LABEL", "")
+# ── env ─────────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+GEO_LAT = os.environ.get("GEO_LAT", "").strip()
+GEO_LON = os.environ.get("GEO_LON", "").strip()
+GEO_CITY = os.environ.get("GEO_CITY", "").strip()
+GEO_LABEL = os.environ.get("GEO_LABEL", "").strip()
+LIVE = os.environ.get("LIVE", "").lower() in ("1", "true", "yes")
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 ROOT = Path(__file__).resolve().parent
 GEO_FILE = ROOT / "geo.json"
-TIMEOUT = 8  # секунд на любой HTTP-запрос
+
+# connect 2s, read 4s — жёстко, без зависаний
+HTTP_TIMEOUT = (2, 4)
 
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo("Europe/Moscow")
 except Exception:
-    TZ = timezone(timedelta(hours=3), name="MSK")
+    TZ = timezone(timedelta(hours=3))
 
-RSS_FEEDS = {
-    "Интерфакс": "https://www.interfax.ru/rss",
-    "BFM": "https://www.bfm.ru/news.rss",
-}
-STOCKS = ["SBER", "GAZP", "LKOH", "ROSN", "GMKN", "VTBR", "MTSS"]
-
+# ── session without endless retries ─────────────────────────────────────────
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TgDigestBot/2.3"})
+SESSION.headers["User-Agent"] = "TgDigestBot/3.0"
+# 0 retries — лучше пропустить блок, чем висеть
+_adapter = HTTPAdapter(max_retries=Retry(total=0, connect=0, read=0, redirect=0))
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 
-BTN_DIGEST = "📊 Дайджест"
-BTN_WEATHER = "🌤 Погода"
-BTN_RATES = "💱 Курсы"
-BTN_CRYPTO = "₿ Крипта"
-BTN_KP = "🧲 Магн. бури"
-BTN_NEWS = "📰 Новости"
-BTN_SHORT = "⚡ Кратко"
-BTN_GEO = "📍 Моя точка"
-BTN_SEND_LOC = "📍 Прислать геолокацию"
+
+def get(url: str, **kw):
+    kw.setdefault("timeout", HTTP_TIMEOUT)
+    return SESSION.get(url, **kw)
+
+
+def post(url: str, **kw):
+    kw.setdefault("timeout", (3, 10))
+    return SESSION.post(url, **kw)
+
+
+def esc(s) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def now_str() -> str:
+    return datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+
+
+# ── geo ─────────────────────────────────────────────────────────────────────
+def load_geo():
+    try:
+        if GEO_FILE.exists():
+            d = json.loads(GEO_FILE.read_text(encoding="utf-8"))
+            if "lat" in d and "lon" in d:
+                return float(d["lat"]), float(d["lon"]), d.get("label") or "Telegram"
+    except Exception:
+        pass
+    return None
+
+
+def save_geo(lat: float, lon: float):
+    GEO_FILE.write_text(
+        json.dumps(
+            {
+                "lat": lat,
+                "lon": lon,
+                "label": f"{lat:.4f},{lon:.4f}",
+                "source": "telegram",
+                "updated_at": datetime.now(TZ).isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def resolve_geo():
+    g = load_geo()
+    if g:
+        return g
+    if GEO_LAT and GEO_LON:
+        try:
+            return float(GEO_LAT), float(GEO_LON), GEO_LABEL or f"{GEO_LAT},{GEO_LON}"
+        except ValueError:
+            pass
+    city = GEO_CITY or ""
+    if city:
+        try:
+            r = get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "ru"},
+            )
+            rows = (r.json() or {}).get("results") or []
+            if rows:
+                p = rows[0]
+                return float(p["latitude"]), float(p["longitude"]), GEO_LABEL or p.get("name") or city
+        except Exception as e:
+            print("geocode fail", e)
+    return None
+
+
+# ── data blocks (каждый сам ловит ошибки) ───────────────────────────────────
+def block_weather() -> str:
+    geo = resolve_geo()
+    if not geo:
+        return (
+            "🌤 <b>Погода</b>\n"
+            "Точка не задана. Кнопка «📍 Прислать геолокацию» "
+            "или Secrets GEO_LAT/GEO_LON / GEO_CITY"
+        )
+    lat, lon, label = geo
+    try:
+        r = get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,wind_speed_10m,wind_gusts_10m,weather_code,relative_humidity_2m",
+                "daily": "sunrise,sunset",
+                "timezone": "Europe/Moscow",
+                "forecast_days": 1,
+            },
+        )
+        if r.status_code != 200:
+            return f"🌤 Погода\nHTTP {r.status_code}"
+        data = r.json()
+        c = data.get("current") or {}
+        d = data.get("daily") or {}
+        codes = {
+            0: "ясно", 1: "почти ясно", 2: "облачно", 3: "пасмурно",
+            45: "туман", 61: "дождь", 71: "снег", 73: "снег", 75: "сильный снег",
+            80: "ливень", 85: "снегопад", 95: "гроза",
+        }
+        try:
+            w = codes.get(int(c.get("weather_code")), "—")
+        except Exception:
+            w = "—"
+        sr = (d.get("sunrise") or ["?"])[0]
+        ss = (d.get("sunset") or ["?"])[0]
+        if isinstance(sr, str) and "T" in sr:
+            sr = sr.split("T")[1][:5]
+        if isinstance(ss, str) and "T" in ss:
+            ss = ss.split("T")[1][:5]
+        return (
+            f"🌤 <b>Погода — {esc(label)}</b>\n"
+            f"📍 {lat:.3f}, {lon:.3f}\n"
+            f"{w}\n"
+            f"Темп: {c.get('temperature_2m')}°C (ощущ. {c.get('apparent_temperature')}°C)\n"
+            f"Ветер: {c.get('wind_speed_10m')} м/с, порывы {c.get('wind_gusts_10m')} м/с\n"
+            f"Влажность: {c.get('relative_humidity_2m')}%\n"
+            f"Восход {sr} · закат {ss}"
+        )
+    except Exception as e:
+        return f"🌤 Погода\nошибка: {type(e).__name__}"
+
+
+def block_kp() -> str:
+    try:
+        r = get("https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json")
+        rows = r.json()
+        if len(rows) < 2:
+            return "🧲 Магн. бури\nнет данных"
+        kp = float(rows[-1][1])
+        lvl = (
+            "спокойно" if kp < 4 else "неспокойно" if kp < 5 else "G1" if kp < 6
+            else "G2" if kp < 7 else "G3" if kp < 8 else "G4+"
+        )
+        return f"🧲 <b>Kp = {kp}</b> — {lvl}\n{rows[-1][0]} UTC"
+    except Exception as e:
+        return f"🧲 Магн. бури\nошибка: {type(e).__name__}"
+
+
+def block_fx() -> str:
+    try:
+        v = get("https://www.cbr-xml-daily.ru/daily_json.js").json()["Valute"]
+        lines = ["💱 <b>Курсы ЦБ</b>"]
+        for code in ("USD", "EUR", "CNY"):
+            if code not in v:
+                continue
+            val = v[code]["Value"]
+            prev = v[code].get("Previous", val)
+            d = val - prev
+            a = "▲" if d > 0 else ("▼" if d < 0 else "•")
+            lines.append(f"{code}: {val:.2f} ₽ ({a}{abs(d):.2f})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"💱 Курсы\nошибка: {type(e).__name__}"
+
+
+def block_crypto() -> str:
+    try:
+        r = get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin,ethereum", "vs_currencies": "usd,rub"},
+        )
+        if r.status_code == 429:
+            return "₿ Крипта\nлимит API, позже"
+        data = r.json()
+        lines = ["₿ <b>Крипта</b>"]
+        for k, n in (("bitcoin", "BTC"), ("ethereum", "ETH")):
+            if k in data:
+                lines.append(
+                    f"{n}: ${data[k].get('usd', 0):,.0f} / {data[k].get('rub', 0):,.0f} ₽"
+                )
+        return "\n".join(lines) if len(lines) > 1 else "₿ Крипта\nнет данных"
+    except Exception as e:
+        return f"₿ Крипта\nошибка: {type(e).__name__}"
+
+
+def block_metals() -> str:
+    try:
+        today = datetime.now(TZ)
+        d1 = (today - timedelta(days=5)).strftime("%d/%m/%Y")
+        d2 = today.strftime("%d/%m/%Y")
+        r = get(f"https://www.cbr.ru/scripts/xml_metall.asp?date_req1={d1}&date_req2={d2}")
+        text = r.content.decode("cp1251", errors="replace")
+        rec = re.findall(
+            r'Code="(\d)".*?<Buy>([^<]+)</Buy>', text, re.DOTALL
+        )
+        names = {"1": "Au", "2": "Ag", "3": "Pt", "4": "Pd"}
+        latest = {}
+        for code, buy in rec:
+            try:
+                latest[code] = float(buy.replace(",", "."))
+            except ValueError:
+                pass
+        if not latest:
+            return "🥇 Металлы\nнет данных"
+        lines = ["🥇 <b>Драгметаллы</b> ₽/г"]
+        for c, n in names.items():
+            if c in latest:
+                lines.append(f"{n}: {latest[c]:,.1f}".replace(",", " "))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"🥇 Металлы\nошибка: {type(e).__name__}"
+
+
+def block_stocks() -> str:
+    try:
+        r = get(
+            "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json",
+            params={
+                "securities": "SBER,GAZP,LKOH,ROSN,GMKN",
+                "iss.meta": "off",
+                "iss.only": "marketdata",
+            },
+        )
+        md = r.json().get("marketdata") or {}
+        cols, rows = md.get("columns") or [], md.get("data") or []
+        if not cols or not rows:
+            return "📈 Акции\nнет данных"
+        i_id = cols.index("SECID") if "SECID" in cols else 0
+        i_last = cols.index("LAST") if "LAST" in cols else None
+        i_chg = cols.index("LASTTOPREVPRICE") if "LASTTOPREVPRICE" in cols else None
+        lines = ["📈 <b>Акции</b>"]
+        for row in rows:
+            if i_last is None or row[i_last] is None:
+                continue
+            sid = row[i_id]
+            last = row[i_last]
+            if i_chg is not None and row[i_chg] is not None:
+                chg = row[i_chg]
+                a = "▲" if chg > 0 else ("▼" if chg < 0 else "•")
+                lines.append(f"{sid}: {last} ({a}{abs(chg):.2f}%)")
+            else:
+                lines.append(f"{sid}: {last}")
+        return "\n".join(lines) if len(lines) > 1 else "📈 Акции\nнет данных"
+    except Exception as e:
+        return f"📈 Акции\nошибка: {type(e).__name__}"
+
+
+def block_news(limit: int = 20) -> str:
+    items = []
+    for src, url in (
+        ("Интерфакс", "https://www.interfax.ru/rss"),
+        ("BFM", "https://www.bfm.ru/news.rss"),
+    ):
+        try:
+            text = get(url).text
+            titles = re.findall(
+                r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
+                text,
+                re.I | re.S,
+            )
+            for t in titles[1:12]:
+                t = re.sub(r"<[^>]+>", "", t).strip()
+                if t:
+                    items.append((src, t))
+        except Exception as e:
+            print("rss", src, type(e).__name__)
+    seen, out = set(), []
+    for src, title in items:
+        k = title.lower()[:70]
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((src, title))
+        if len(out) >= limit:
+            break
+    if not out:
+        return "📰 Новости\nнет данных"
+    lines = [f"📰 <b>Новости</b> ({len(out)})"]
+    for i, (src, title) in enumerate(out, 1):
+        lines.append(f"{i}. [{src}] {esc(title)}")
+    return "\n".join(lines)
+
+
+def block_short() -> str:
+    parts = []
+    try:
+        v = get("https://www.cbr-xml-daily.ru/daily_json.js").json()["Valute"]
+        parts.append(f"USD {v['USD']['Value']:.1f}")
+        parts.append(f"EUR {v['EUR']['Value']:.1f}")
+    except Exception:
+        pass
+    try:
+        r = get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+        )
+        if r.status_code == 200:
+            parts.append(f"BTC ${r.json()['bitcoin']['usd']:,.0f}")
+    except Exception:
+        pass
+    return "⚡ " + " · ".join(parts) if parts else "⚡ сводка"
+
+
+def build_digest(full: bool = True) -> str:
+    """Последовательно, каждый блок ≤ ~4с. Без thread pool — проще и предсказуемее."""
+    t0 = time.time()
+    parts = [f"{'📊' if full else '⚡'} <b>Дайджест {now_str()}</b> МСК", block_short()]
+    parts.append(block_weather())
+    parts.append(block_kp())
+    parts.append(block_fx())
+    parts.append(block_crypto())
+    if full:
+        parts.append(block_metals())
+        parts.append(block_stocks())
+        parts.append(block_news(25))
+    print(f"digest built in {time.time()-t0:.1f}s")
+    return "\n\n".join(parts)
+
+
+# ── telegram ────────────────────────────────────────────────────────────────
+BTN = {
+    "digest": "📊 Дайджест",
+    "short": "⚡ Кратко",
+    "weather": "🌤 Погода",
+    "kp": "🧲 Магн. бури",
+    "rates": "💱 Курсы",
+    "crypto": "₿ Крипта",
+    "news": "📰 Новости",
+    "geo": "📍 Моя точка",
+    "loc": "📍 Прислать геолокацию",
+}
 
 KEYBOARD = {
     "keyboard": [
-        [{"text": BTN_DIGEST}, {"text": BTN_SHORT}],
-        [{"text": BTN_WEATHER}, {"text": BTN_KP}],
-        [{"text": BTN_RATES}, {"text": BTN_CRYPTO}],
-        [{"text": BTN_NEWS}, {"text": BTN_GEO}],
-        [{"text": BTN_SEND_LOC, "request_location": True}],
+        [{"text": BTN["digest"]}, {"text": BTN["short"]}],
+        [{"text": BTN["weather"]}, {"text": BTN["kp"]}],
+        [{"text": BTN["rates"]}, {"text": BTN["crypto"]}],
+        [{"text": BTN["news"]}, {"text": BTN["geo"]}],
+        [{"text": BTN["loc"], "request_location": True}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
 }
 
 
-def esc(s: str) -> str:
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def http_get(url: str, **kwargs):
-    kwargs.setdefault("timeout", TIMEOUT)
-    return SESSION.get(url, **kwargs)
-
-
-def now_msk() -> datetime:
-    return datetime.now(TZ)
-
-
-# ─── Гео ────────────────────────────────────────────────────────────────────
-def load_geo_file() -> dict | None:
-    if not GEO_FILE.exists():
-        return None
-    try:
-        data = json.loads(GEO_FILE.read_text(encoding="utf-8"))
-        if "lat" in data and "lon" in data:
-            return data
-    except Exception as e:
-        print("geo.json:", e)
-    return None
-
-
-def save_geo_file(lat: float, lon: float, label: str = "", source: str = "telegram") -> None:
-    payload = {
-        "lat": lat,
-        "lon": lon,
-        "label": label or f"{lat:.4f},{lon:.4f}",
-        "source": source,
-        "updated_at": now_msk().isoformat(timespec="seconds"),
-    }
-    GEO_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def geo_from_ip() -> tuple[float, float, str] | None:
-    for url in ("https://ipapi.co/json/", "https://ipinfo.io/json"):
-        try:
-            d = http_get(url).json()
-            if "latitude" in d and "longitude" in d:
-                return float(d["latitude"]), float(d["longitude"]), str(d.get("city") or "IP")
-            loc = (d.get("loc") or "").split(",")
-            if len(loc) == 2:
-                return float(loc[0]), float(loc[1]), str(d.get("city") or "IP")
-        except Exception as e:
-            print("ip geo:", e)
-    return None
-
-
-def geo_from_city(name: str) -> tuple[float, float, str] | None:
-    try:
-        r = http_get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": name, "count": 1, "language": "ru", "format": "json"},
-        )
-        results = r.json().get("results") or []
-        if results:
-            p = results[0]
-            return float(p["latitude"]), float(p["longitude"]), GEO_LABEL or p.get("name") or name
-    except Exception as e:
-        print("geocode:", e)
-    return None
-
-
-def resolve_geo() -> tuple[float, float, str] | None:
-    if GEO_MODE in ("auto", "telegram"):
-        saved = load_geo_file()
-        if saved:
-            return float(saved["lat"]), float(saved["lon"]), saved.get("label") or "Telegram"
-    if GEO_MODE in ("auto", "city", "telegram"):
-        if GEO_LAT and GEO_LON:
-            try:
-                lat, lon = float(GEO_LAT), float(GEO_LON)
-                return lat, lon, GEO_LABEL or f"{lat:.2f},{lon:.2f}"
-            except ValueError:
-                pass
-        if GEO_CITY:
-            g = geo_from_city(GEO_CITY)
-            if g:
-                return g
-    if GEO_MODE == "ip" or (GEO_MODE == "auto" and os.environ.get("LIVE")):
-        g = geo_from_ip()
-        if g:
-            return g
-    if GEO_CITY:
-        return geo_from_city(GEO_CITY)
-    return None
-
-
-# ─── Блоки ──────────────────────────────────────────────────────────────────
-def get_weather() -> str:
-    geo = resolve_geo()
-    if not geo:
-        return (
-            "🌤 <b>Погода</b>\nТочка не задана.\n"
-            "Кнопка <b>📍 Прислать геолокацию</b> (Termux LIVE) или Secrets GEO_LAT/GEO_LON/GEO_CITY"
-        )
-    lat, lon, label = geo
-    try:
-        r = http_get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,weather_code,visibility",
-                "daily": "sunrise,sunset,daylight_duration",
-                "timezone": "Europe/Moscow",
-                "forecast_days": 1,
-            },
-        )
-        data = r.json()
-        cur = data.get("current", {})
-        daily = data.get("daily", {})
-        table = {
-            0: "ясно", 1: "почти ясно", 2: "переменная облачность", 3: "пасмурно",
-            45: "туман", 48: "изморозь", 51: "морось", 61: "дождь", 71: "снег",
-            73: "снег", 75: "сильный снег", 77: "снежная крупа", 80: "ливень",
-            85: "снегопад", 95: "гроза",
-        }
-        try:
-            code_s = table.get(int(cur.get("weather_code")), "—")
-        except (TypeError, ValueError):
-            code_s = "—"
-        sunrise = (daily.get("sunrise") or ["?"])[0]
-        sunset = (daily.get("sunset") or ["?"])[0]
-        if isinstance(sunrise, str) and "T" in sunrise:
-            sunrise = sunrise.split("T")[1][:5]
-        if isinstance(sunset, str) and "T" in sunset:
-            sunset = sunset.split("T")[1][:5]
-        daylen = (daily.get("daylight_duration") or [None])[0]
-        day_h = f"{daylen/3600:.1f} ч" if daylen else "—"
-        vis = cur.get("visibility")
-        vis_km = f"{vis/1000:.1f} км" if vis is not None else "—"
-        return "\n".join([
-            f"🌤 <b>Погода — {esc(label)}</b>",
-            f"📍 {lat:.4f}, {lon:.4f}",
-            code_s,
-            f"Темп: {cur.get('temperature_2m')}°C (ощущ. {cur.get('apparent_temperature')}°C)",
-            f"Ветер: {cur.get('wind_speed_10m')} м/с, порывы {cur.get('wind_gusts_10m')} м/с",
-            f"Влажность: {cur.get('relative_humidity_2m')}% · видимость: {vis_km}",
-            f"Восход {sunrise} · закат {sunset} · день {day_h}",
-        ])
-    except Exception as e:
-        return f"🌤 Погода\nошибка: {e}"
-
-
-def get_kp() -> str:
-    try:
-        rows = http_get("https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json").json()
-        if len(rows) < 2:
-            return "🧲 Магн. бури\nнет данных"
-        last = rows[-1]
-        kp = float(last[1])
-        level = (
-            "спокойно" if kp < 4 else "неспокойно" if kp < 5 else "буря G1" if kp < 6
-            else "буря G2" if kp < 7 else "буря G3" if kp < 8 else "буря G4" if kp < 9
-            else "экстремальная G5"
-        )
-        return (
-            f"🧲 <b>Магнитная активность</b>\nKp = {kp} — {level}\n"
-            f"обновлено: {last[0]} UTC\nНа Севере при Kp≥5 возможны сбои связи."
-        )
-    except Exception as e:
-        return f"🧲 Магн. бури\nошибка: {e}"
-
-
-def get_currencies() -> str:
-    try:
-        v = http_get("https://www.cbr-xml-daily.ru/daily_json.js").json()["Valute"]
-        lines = ["💱 <b>Курсы валют ЦБ РФ</b>"]
-        for code in ("USD", "EUR", "CNY"):
-            if code in v:
-                val, prev = v[code]["Value"], v[code].get("Previous", v[code]["Value"])
-                diff = val - prev
-                arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "•")
-                lines.append(f"{code}: {val:.2f} ₽ ({arrow}{abs(diff):.2f})")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"💱 Курсы\nошибка: {e}"
-
-
-def get_crypto() -> str:
-    try:
-        data = http_get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin,ethereum,tether,the-open-network,solana", "vs_currencies": "usd,rub"},
-        ).json()
-        lines = ["₿ <b>Криптовалюты</b>"]
-        for key, name in [
-            ("bitcoin", "BTC"), ("ethereum", "ETH"), ("tether", "USDT"),
-            ("the-open-network", "TON"), ("solana", "SOL"),
-        ]:
-            if key in data:
-                d = data[key]
-                lines.append(f"{name}: ${d.get('usd', 0):,.2f} / {d.get('rub', 0):,.0f} ₽")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"₿ Крипта\nошибка: {e}"
-
-
-def get_precious_metals() -> str:
-    try:
-        today = now_msk()
-        d1 = (today - timedelta(days=7)).strftime("%d/%m/%Y")
-        d2 = today.strftime("%d/%m/%Y")
-        r = http_get(f"https://www.cbr.ru/scripts/xml_metall.asp?date_req1={d1}&date_req2={d2}")
-        text = r.content.decode("cp1251", errors="replace")
-        records = re.findall(r'Date="([^"]+)"[^>]*Code="(\d)".*?<Buy>([^<]+)</Buy>', text, re.DOTALL)
-        codes = {"1": "Золото", "2": "Серебро", "3": "Платина", "4": "Палладий"}
-        latest = {}
-        for _, code, buy in records:
-            try:
-                latest[code] = float(buy.replace(",", "."))
-            except ValueError:
-                pass
-        if not latest:
-            return "🥇 Драгметаллы\nнедоступны"
-        lines = ["🥇 <b>Драгметаллы</b> (ЦБ, ₽/г)"]
-        for code, name in codes.items():
-            if code in latest:
-                lines.append(f"{name}: {latest[code]:,.2f}".replace(",", " "))
-        return "\n".join(lines)
-    except Exception as e:
-        return f"🥇 Драгметаллы\nошибка: {e}"
-
-
-def get_oil() -> str:
-    try:
-        r = http_get(
-            "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json",
-            params={"iss.meta": "off", "iss.only": "securities"},
-        )
-        data = r.json()
-        cols = data.get("securities", {}).get("columns", [])
-        rows = data.get("securities", {}).get("data", [])
-        if "SECID" in cols and "PREVSETTLEPRICE" in cols:
-            i_id, i_p = cols.index("SECID"), cols.index("PREVSETTLEPRICE")
-            for row in rows:
-                sid = str(row[i_id])
-                if sid.startswith("BR") and row[i_p]:
-                    return f"🛢 <b>Нефть</b> (фьюч. {sid})\n{row[i_p]} USD"
-        return "🛢 Нефть\nнедоступно"
-    except Exception as e:
-        return f"🛢 Нефть\nошибка: {e}"
-
-
-def get_stocks() -> str:
-    try:
-        r = http_get(
-            "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json",
-            params={"securities": ",".join(STOCKS), "iss.meta": "off", "iss.only": "marketdata"},
-        )
-        md = r.json().get("marketdata", {})
-        cols, rows = md.get("columns", []), md.get("data", [])
-        if not cols or not rows:
-            return "📈 Акции\nнедоступны"
-        idx_id = cols.index("SECID") if "SECID" in cols else 0
-        idx_last = cols.index("LAST") if "LAST" in cols else None
-        idx_chg = cols.index("LASTTOPREVPRICE") if "LASTTOPREVPRICE" in cols else None
-        lines = ["📈 <b>Акции</b> (Мосбиржа)"]
-        for row in rows:
-            last = row[idx_last] if idx_last is not None else None
-            if last is None:
-                continue
-            sid = row[idx_id]
-            chg = row[idx_chg] if idx_chg is not None else None
-            if chg is not None:
-                arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "•")
-                lines.append(f"{sid}: {last} ({arrow}{abs(chg):.2f}%)")
-            else:
-                lines.append(f"{sid}: {last}")
-        return "\n".join(lines) if len(lines) > 1 else "📈 Акции\nнедоступны"
-    except Exception as e:
-        return f"📈 Акции\nошибка: {e}"
-
-
-def get_news(limit: int = 40) -> str:
-    items = []
-    for source, url in RSS_FEEDS.items():
-        try:
-            text = http_get(url).text
-            titles = re.findall(
-                r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>",
-                text, re.DOTALL | re.IGNORECASE,
-            )
-            for t in titles[1:16]:
-                t = re.sub(r"<[^>]+>", "", t).strip()
-                if t:
-                    items.append((source, t))
-        except Exception as e:
-            print("rss", source, e)
-    seen, unique = set(), []
-    for src, title in items:
-        key = title.lower()[:80]
-        if key not in seen:
-            seen.add(key)
-            unique.append((src, title))
-    unique = unique[:limit]
-    if not unique:
-        return "📰 Новости\nне удалось получить"
-    lines = [f"📰 <b>Новости</b> ({len(unique)})"]
-    for i, (src, title) in enumerate(unique, 1):
-        lines.append(f"{i}. [{src}] {esc(title)}")
-    return "\n".join(lines)
-
-
-def get_short_summary() -> str:
-    parts = []
-    try:
-        v = http_get("https://www.cbr-xml-daily.ru/daily_json.js").json()["Valute"]
-        parts.append(f"USD {v['USD']['Value']:.1f}")
-        parts.append(f"EUR {v['EUR']['Value']:.1f}")
-    except Exception:
-        pass
-    try:
-        c = http_get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd"},
-        ).json()
-        parts.append(f"BTC ${c['bitcoin']['usd']:,.0f}")
-    except Exception:
-        pass
-    geo = resolve_geo()
-    if geo:
-        try:
-            lat, lon, label = geo
-            w = http_get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude": lat, "longitude": lon,
-                    "current": "temperature_2m,wind_speed_10m",
-                    "timezone": "Europe/Moscow",
-                },
-            ).json().get("current", {})
-            parts.append(f"{label} {w.get('temperature_2m')}°C ветер {w.get('wind_speed_10m')}м/с")
-        except Exception:
-            pass
-    return "⚡ " + " · ".join(parts) if parts else "⚡ сводка недоступна"
-
-
-def _safe(fn, default: str) -> str:
-    try:
-        return fn()
-    except Exception as e:
-        return f"{default}\nошибка: {e}"
-
-
-def build_digest(full: bool = True) -> str:
-    now = now_msk().strftime("%d.%m.%Y %H:%M")
-    tasks = {
-        "short": get_short_summary,
-        "weather": get_weather,
-        "kp": get_kp,
-        "cur": get_currencies,
-        "crypto": get_crypto,
-    }
-    if full:
-        tasks.update({
-            "metals": get_precious_metals,
-            "oil": get_oil,
-            "stocks": get_stocks,
-            "news": lambda: get_news(40),
-        })
-
-    results = {}
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(fn): key for key, fn in tasks.items()}
-        try:
-            for fut in as_completed(futs, timeout=25):
-                key = futs[fut]
-                try:
-                    results[key] = fut.result(timeout=1)
-                except Exception as e:
-                    results[key] = f"блок {key}: {e}"
-        except Exception:
-            for fut, key in futs.items():
-                if key not in results:
-                    results[key] = f"блок {key}: таймаут"
-
-    order = ["short", "weather", "kp", "cur", "crypto"]
-    if full:
-        order += ["metals", "oil", "stocks", "news"]
-    title = f"{'📊 <b>Дайджест' if full else '⚡ <b>Кратко'} на {now}</b> (МСК)"
-    parts = [title] + [results.get(k, "") for k in order]
-    return "\n\n".join(p for p in parts if p)
-
-
-def geo_status_text() -> str:
-    g = resolve_geo()
-    saved = load_geo_file()
-    lines = ["📍 <b>Геоточка</b>"]
-    if g:
-        lines.append(f"Сейчас: {esc(g[2])} — {g[0]:.4f}, {g[1]:.4f}")
+def tg(method: str, **kwargs) -> dict:
+    if "json" in kwargs or method.startswith("send") or method in (
+        "deleteWebhook",
+        "sendMessage",
+    ):
+        r = post(f"{TG}/{method}", **kwargs)
     else:
-        lines.append("не задана")
-    if saved:
-        lines.append(f"geo.json: {saved.get('updated_at', '—')}")
-    lines.append("Кнопка <b>📍 Прислать геолокацию</b> или Secrets GEO_LAT/GEO_LON")
-    return "\n".join(lines)
+        r = get(f"{TG}/{method}", **kwargs)
+    try:
+        return r.json()
+    except Exception:
+        return {"ok": False, "description": r.text[:200]}
 
 
-# ─── Telegram ───────────────────────────────────────────────────────────────
-def tg_api(method: str, payload: dict | None = None, params: dict | None = None) -> dict:
-    if payload is not None:
-        r = SESSION.post(f"{TG_API}/{method}", json=payload, timeout=20)
-    else:
-        r = SESSION.get(f"{TG_API}/{method}", params=params or {}, timeout=55)
-    return r.json()
-
-
-def send_message(chat_id: str | int, text: str, with_keyboard: bool = False) -> bool:
-    MAX_LEN = 4000
+def send(chat_id, text: str, keyboard: bool = False) -> bool:
     chunks = []
     while text:
-        if len(text) <= MAX_LEN:
+        if len(text) <= 3900:
             chunks.append(text)
             break
-        cut = text.rfind("\n", 0, MAX_LEN)
-        if cut < 100:
-            cut = MAX_LEN
+        cut = text.rfind("\n", 0, 3900)
+        if cut < 50:
+            cut = 3900
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
     ok = True
-    for i, chunk in enumerate(chunks):
+    for i, ch in enumerate(chunks):
         body = {
             "chat_id": chat_id,
-            "text": chunk,
+            "text": ch,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        if with_keyboard and i == len(chunks) - 1:
+        if keyboard and i == len(chunks) - 1:
             body["reply_markup"] = KEYBOARD
         try:
-            data = tg_api("sendMessage", payload=body)
-            print(f"send {i+1}/{len(chunks)}: ok={data.get('ok')}")
+            data = tg("sendMessage", json=body)
+            print("send", data.get("ok"), data.get("description", ""))
             if not data.get("ok"):
-                print(data)
                 ok = False
         except Exception as e:
-            print("send error", e)
+            print("send err", e)
             ok = False
     return ok
 
 
-def handle_location(chat_id: int, lat: float, lon: float) -> None:
-    save_geo_file(lat, lon, label=f"{lat:.4f},{lon:.4f}", source="telegram")
-    send_message(
+def on_location(chat_id, lat: float, lon: float):
+    save_geo(lat, lon)
+    send(
         chat_id,
-        f"📍 <b>Точка сохранена</b>\n{lat:.5f}, {lon:.5f}\n\n"
-        f"Secrets для Actions:\n<code>GEO_LAT</code>={lat:.5f}\n<code>GEO_LON</code>={lon:.5f}\n\n"
-        + get_weather(),
-        with_keyboard=True,
+        f"📍 Точка сохранена\n<code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n\n"
+        f"Для Actions Secrets:\nGEO_LAT={lat:.5f}\nGEO_LON={lon:.5f}\n\n"
+        + block_weather(),
+        keyboard=True,
     )
 
 
-def handle_text(chat_id: int, text: str) -> None:
+def on_text(chat_id, text: str):
     t = (text or "").strip()
     low = t.lower()
-    if t in (BTN_DIGEST, "/now", "/digest", "/start") or low == "дайджест":
+
+    if t in (BTN["digest"], "/now", "/digest", "/start") or low == "дайджест":
         if t == "/start":
-            send_message(
+            send(
                 chat_id,
                 "Привет! Кнопки внизу.\n"
-                "📍 — «Прислать геолокацию».\n"
-                "Расписание: 08:00 и 20:00 МСК.",
-                with_keyboard=True,
+                "📍 Прислать геолокацию — для погоды.\n"
+                "Автодайджест: 08:00 и 20:00 МСК.",
+                keyboard=True,
             )
-        send_message(chat_id, build_digest(True), with_keyboard=True)
-    elif t in (BTN_SHORT, "/short") or low == "кратко":
-        send_message(chat_id, build_digest(False), with_keyboard=True)
-    elif t in (BTN_WEATHER, "/weather") or low == "погода":
-        send_message(chat_id, get_weather(), with_keyboard=True)
-    elif t in (BTN_RATES, "/rates") or low == "курсы":
-        send_message(chat_id, get_currencies() + "\n\n" + get_precious_metals(), with_keyboard=True)
-    elif t in (BTN_CRYPTO, "/crypto") or low == "крипта":
-        send_message(chat_id, get_crypto(), with_keyboard=True)
-    elif t in (BTN_KP, "/kp") or "магн" in low or low == "бури":
-        send_message(chat_id, get_kp(), with_keyboard=True)
-    elif t in (BTN_NEWS, "/news") or low == "новости":
-        send_message(chat_id, get_news(25), with_keyboard=True)
-    elif t in (BTN_GEO, "/geo") or "точк" in low:
-        send_message(chat_id, geo_status_text(), with_keyboard=True)
+        send(chat_id, "⏳ Собираю…", keyboard=False)
+        send(chat_id, build_digest(True), keyboard=True)
+    elif t in (BTN["short"], "/short") or low == "кратко":
+        send(chat_id, build_digest(False), keyboard=True)
+    elif t in (BTN["weather"], "/weather") or low == "погода":
+        send(chat_id, block_weather(), keyboard=True)
+    elif t in (BTN["rates"], "/rates") or low == "курсы":
+        send(chat_id, block_fx() + "\n\n" + block_metals(), keyboard=True)
+    elif t in (BTN["crypto"], "/crypto") or low == "крипта":
+        send(chat_id, block_crypto(), keyboard=True)
+    elif t in (BTN["kp"], "/kp") or "магн" in low:
+        send(chat_id, block_kp(), keyboard=True)
+    elif t in (BTN["news"], "/news") or low == "новости":
+        send(chat_id, block_news(20), keyboard=True)
+    elif t in (BTN["geo"], "/geo") or "точк" in low:
+        g = resolve_geo()
+        msg = "📍 <b>Геоточка</b>\n"
+        msg += f"{g[2]}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана"
+        send(chat_id, msg, keyboard=True)
     else:
-        send_message(
-            chat_id,
-            "/now /weather /rates /crypto /kp /news /short /geo\n"
-            "или кнопка 📍 Прислать геолокацию",
-            with_keyboard=True,
-        )
+        send(chat_id, "Кнопки внизу или /now /weather /rates", keyboard=True)
 
 
-def run_live() -> None:
+def run_live():
     if not BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN не задан")
-    print("LIVE mode…")
-    offset = 0
+        raise SystemExit("Нет TELEGRAM_BOT_TOKEN")
+    print("LIVE mode started (Ctrl+C to stop)")
     try:
-        tg_api("deleteWebhook", payload={})
+        tg("deleteWebhook", json={})
     except Exception as e:
-        print("deleteWebhook:", e)
+        print("deleteWebhook", e)
+    offset = 0
     while True:
         try:
-            data = tg_api("getUpdates", params={"timeout": 40, "offset": offset})
+            # timeout long-poll 25s, HTTP read 30s
+            r = SESSION.get(
+                f"{TG}/getUpdates",
+                params={"timeout": 25, "offset": offset},
+                timeout=(5, 35),
+            )
+            data = r.json()
             if not data.get("ok"):
-                print("getUpdates", data)
-                time.sleep(3)
+                print("getUpdates bad", data)
+                time.sleep(2)
                 continue
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or upd.get("edited_message")
+            for u in data.get("result") or []:
+                offset = u["update_id"] + 1
+                msg = u.get("message") or u.get("edited_message")
                 if not msg:
                     continue
-                chat_id = msg["chat"]["id"]
-                if CHAT_ID and str(chat_id) != str(CHAT_ID):
+                cid = msg["chat"]["id"]
+                if CHAT_ID and str(cid) != str(CHAT_ID):
                     continue
                 if "location" in msg:
                     loc = msg["location"]
-                    handle_location(chat_id, float(loc["latitude"]), float(loc["longitude"]))
-                    continue
-                text = msg.get("text") or ""
-                if text:
-                    handle_text(chat_id, text)
+                    on_location(cid, float(loc["latitude"]), float(loc["longitude"]))
+                elif msg.get("text"):
+                    on_text(cid, msg["text"])
+        except requests.exceptions.ReadTimeout:
+            # норма для long poll
+            continue
         except Exception as e:
-            print("live:", e)
-            time.sleep(5)
+            print("loop", type(e).__name__, e)
+            time.sleep(3)
 
 
-def main() -> None:
-    if os.environ.get("LIVE", "").lower() in ("1", "true", "yes"):
+def main():
+    if LIVE:
         run_live()
         return
-    print("Собираю дайджест…")
+    print("Building digest…")
     text = build_digest(True)
-    print(f"Длина: {len(text)} символов")
+    print("len", len(text))
     if not BOT_TOKEN or not CHAT_ID:
-        print(text[:1500])
+        print(text[:2000])
         raise SystemExit("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
-    ok = send_message(CHAT_ID, text, with_keyboard=True)
+    ok = send(CHAT_ID, text, keyboard=True)
     print("OK" if ok else "FAILED")
     if not ok:
         raise SystemExit(1)
