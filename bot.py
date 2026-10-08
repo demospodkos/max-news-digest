@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram digest bot — hard timeouts, never hangs."""
+"""Telegram digest — inline-кнопки (не занимают экран), жёсткие таймауты."""
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -30,12 +31,13 @@ HTTP_TIMEOUT = (2, 4)
 
 try:
     from zoneinfo import ZoneInfo
+
     TZ = ZoneInfo("Europe/Moscow")
 except Exception:
     TZ = timezone(timedelta(hours=3))
 
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "TgDigestBot/3.1"
+SESSION.headers["User-Agent"] = "TgDigestBot/3.2"
 _adapter = HTTPAdapter(max_retries=Retry(total=0, connect=0, read=0, redirect=0))
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
@@ -52,13 +54,14 @@ def post(url: str, **kw):
 
 
 def esc(s) -> str:
-    return str(s).replace("&", "&").replace("<", "<").replace(">", ">")
+    return html.escape(str(s), quote=False)
 
 
 def now_str() -> str:
     return datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
 
 
+# ── geo ─────────────────────────────────────────────────────────────────────
 def load_geo():
     try:
         if GEO_FILE.exists():
@@ -96,29 +99,33 @@ def resolve_geo():
             return float(GEO_LAT), float(GEO_LON), GEO_LABEL or f"{GEO_LAT},{GEO_LON}"
         except ValueError:
             pass
-    city = GEO_CITY or ""
-    if city:
+    if GEO_CITY:
         try:
             r = get(
                 "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": city, "count": 1, "language": "ru"},
+                params={"name": GEO_CITY, "count": 1, "language": "ru"},
             )
             rows = (r.json() or {}).get("results") or []
             if rows:
                 p = rows[0]
-                return float(p["latitude"]), float(p["longitude"]), GEO_LABEL or p.get("name") or city
+                return (
+                    float(p["latitude"]),
+                    float(p["longitude"]),
+                    GEO_LABEL or p.get("name") or GEO_CITY,
+                )
         except Exception as e:
-            print("geocode fail", e)
+            print("geocode", e)
     return None
 
 
+# ── data ────────────────────────────────────────────────────────────────────
 def block_weather() -> str:
     geo = resolve_geo()
     if not geo:
         return (
             "🌤 <b>Погода</b>\n"
-            "Точка не задана. Кнопка «📍 Прислать геолокацию» "
-            "или Secrets GEO_LAT/GEO_LON / GEO_CITY"
+            "Точка не задана.\n"
+            "Нажмите «📍 Гео» ниже или Secrets GEO_LAT/GEO_LON / GEO_CITY"
         )
     lat, lon, label = geo
     try:
@@ -139,9 +146,18 @@ def block_weather() -> str:
         c = data.get("current") or {}
         d = data.get("daily") or {}
         codes = {
-            0: "ясно", 1: "почти ясно", 2: "облачно", 3: "пасмурно",
-            45: "туман", 61: "дождь", 71: "снег", 73: "снег", 75: "сильный снег",
-            80: "ливень", 85: "снегопад", 95: "гроза",
+            0: "ясно",
+            1: "почти ясно",
+            2: "облачно",
+            3: "пасмурно",
+            45: "туман",
+            61: "дождь",
+            71: "снег",
+            73: "снег",
+            75: "сильный снег",
+            80: "ливень",
+            85: "снегопад",
+            95: "гроза",
         }
         try:
             w = codes.get(int(c.get("weather_code")), "—")
@@ -168,22 +184,30 @@ def block_weather() -> str:
 
 def block_kp() -> str:
     try:
-        r = get("https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json")
-        rows = r.json()
+        rows = get("https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json").json()
         if not rows:
             return "🧲 Магн. бури\nнет данных"
         last = rows[-1]
         if isinstance(last, dict):
             kp = float(last.get("Kp") or last.get("kp") or 0)
-            tag = last.get("time_tag") or last.get("time") or ""
+            tag = last.get("time_tag") or ""
         else:
             if isinstance(last[0], str) and str(last[0]).lower().startswith("time"):
                 last = rows[-2] if len(rows) > 1 else last
             kp = float(last[1])
             tag = last[0]
         lvl = (
-            "спокойно" if kp < 4 else "неспокойно" if kp < 5 else "G1" if kp < 6
-            else "G2" if kp < 7 else "G3" if kp < 8 else "G4+"
+            "спокойно"
+            if kp < 4
+            else "неспокойно"
+            if kp < 5
+            else "G1"
+            if kp < 6
+            else "G2"
+            if kp < 7
+            else "G3"
+            if kp < 8
+            else "G4+"
         )
         return f"🧲 <b>Kp = {kp}</b> — {lvl}\n{tag} UTC"
     except Exception as e:
@@ -274,8 +298,7 @@ def block_stocks() -> str:
         for row in rows:
             if i_last is None or row[i_last] is None:
                 continue
-            sid = row[i_id]
-            last = row[i_last]
+            sid, last = row[i_id], row[i_last]
             if i_chg is not None and row[i_chg] is not None:
                 chg = row[i_chg]
                 a = "▲" if chg > 0 else ("▼" if chg < 0 else "•")
@@ -354,47 +377,52 @@ def build_digest(full: bool = True) -> str:
         parts.append(block_metals())
         parts.append(block_stocks())
         parts.append(block_news(25))
-    print(f"digest built in {time.time()-t0:.1f}s")
+    print(f"digest {time.time()-t0:.1f}s")
     return "\n\n".join(parts)
 
 
-BTN = {
-    "digest": "📊 Дайджест",
-    "short": "⚡ Кратко",
-    "weather": "🌤 Погода",
-    "kp": "🧲 Магн. бури",
-    "rates": "💱 Курсы",
-    "crypto": "₿ Крипта",
-    "news": "📰 Новости",
-    "geo": "📍 Моя точка",
-    "loc": "📍 Прислать геолокацию",
+# ── keyboards: inline (компактные) + одноразовая гео ─────────────────────────
+INLINE = {
+    "inline_keyboard": [
+        [
+            {"text": "📊 Дайджест", "callback_data": "digest"},
+            {"text": "⚡ Кратко", "callback_data": "short"},
+        ],
+        [
+            {"text": "🌤 Погода", "callback_data": "weather"},
+            {"text": "🧲 Kp", "callback_data": "kp"},
+        ],
+        [
+            {"text": "💱 Курсы", "callback_data": "rates"},
+            {"text": "₿ Крипта", "callback_data": "crypto"},
+        ],
+        [
+            {"text": "📰 Новости", "callback_data": "news"},
+            {"text": "📍 Точка", "callback_data": "geo"},
+        ],
+        [{"text": "📍 Прислать геолокацию", "callback_data": "ask_loc"}],
+    ]
 }
 
-KEYBOARD = {
-    "keyboard": [
-        [{"text": BTN["digest"]}, {"text": BTN["short"]}],
-        [{"text": BTN["weather"]}, {"text": BTN["kp"]}],
-        [{"text": BTN["rates"]}, {"text": BTN["crypto"]}],
-        [{"text": BTN["news"]}, {"text": BTN["geo"]}],
-        [{"text": BTN["loc"], "request_location": True}],
-    ],
+# Только для запроса гео — одна кнопка, one_time, без is_persistent
+GEO_REPLY = {
+    "keyboard": [[{"text": "📍 Отправить мою геолокацию", "request_location": True}]],
     "resize_keyboard": True,
-    "is_persistent": True,
+    "one_time_keyboard": True,
 }
+
+REMOVE_REPLY = {"remove_keyboard": True}
 
 
 def tg(method: str, **kwargs) -> dict:
-    if "json" in kwargs or method in ("deleteWebhook", "sendMessage"):
-        r = post(f"{TG}/{method}", **kwargs)
-    else:
-        r = get(f"{TG}/{method}", **kwargs)
+    r = post(f"{TG}/{method}", **kwargs)
     try:
         return r.json()
     except Exception:
-        return {"ok": False, "description": r.text[:200]}
+        return {"ok": False, "description": getattr(r, "text", "")[:200]}
 
 
-def send(chat_id, text: str, keyboard: bool = False) -> bool:
+def send(chat_id, text: str, markup=None) -> bool:
     chunks = []
     while text:
         if len(text) <= 3900:
@@ -413,8 +441,8 @@ def send(chat_id, text: str, keyboard: bool = False) -> bool:
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        if keyboard and i == len(chunks) - 1:
-            body["reply_markup"] = KEYBOARD
+        if markup is not None and i == len(chunks) - 1:
+            body["reply_markup"] = markup
         try:
             data = tg("sendMessage", json=body)
             print("send", data.get("ok"), data.get("description", ""))
@@ -426,56 +454,91 @@ def send(chat_id, text: str, keyboard: bool = False) -> bool:
     return ok
 
 
+def answer_cb(cb_id: str, text: str = "") -> None:
+    try:
+        tg("answerCallbackQuery", json={"callback_query_id": cb_id, "text": text[:200]})
+    except Exception as e:
+        print("cb answer", e)
+
+
+def handle_action(chat_id, action: str) -> None:
+    if action == "digest":
+        send(chat_id, "⏳ …", markup=None)
+        send(chat_id, build_digest(True), markup=INLINE)
+    elif action == "short":
+        send(chat_id, build_digest(False), markup=INLINE)
+    elif action == "weather":
+        send(chat_id, block_weather(), markup=INLINE)
+    elif action == "kp":
+        send(chat_id, block_kp(), markup=INLINE)
+    elif action == "rates":
+        send(chat_id, block_fx() + "\n\n" + block_metals(), markup=INLINE)
+    elif action == "crypto":
+        send(chat_id, block_crypto(), markup=INLINE)
+    elif action == "news":
+        send(chat_id, block_news(20), markup=INLINE)
+    elif action == "geo":
+        g = resolve_geo()
+        msg = "📍 <b>Геоточка</b>\n"
+        msg += f"{esc(g[2])}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана"
+        send(chat_id, msg, markup=INLINE)
+    elif action == "ask_loc":
+        send(
+            chat_id,
+            "Нажмите кнопку ниже — Telegram запросит геолокацию.\n"
+            "После отправки клавиатура снова скроется.",
+            markup=GEO_REPLY,
+        )
+    else:
+        send(chat_id, "Выберите кнопку под сообщением.", markup=INLINE)
+
+
 def on_location(chat_id, lat: float, lon: float):
     save_geo(lat, lon)
+    send(chat_id, "✅", markup=REMOVE_REPLY)  # убрать reply-клаву
     send(
         chat_id,
         f"📍 Точка сохранена\n<code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n\n"
-        f"Для Actions Secrets:\nGEO_LAT={lat:.5f}\nGEO_LON={lon:.5f}\n\n"
+        f"Secrets: GEO_LAT={lat:.5f} GEO_LON={lon:.5f}\n\n"
         + block_weather(),
-        keyboard=True,
+        markup=INLINE,
     )
 
 
 def on_text(chat_id, text: str):
     t = (text or "").strip()
     low = t.lower()
-    if t in (BTN["digest"], "/now", "/digest", "/start") or low == "дайджест":
+    if t in ("/start", "/now", "/digest") or low == "дайджест":
         if t == "/start":
             send(
                 chat_id,
-                "Привет! Кнопки внизу.\n"
-                "📍 Прислать геолокацию — для погоды.\n"
+                "Привет! Кнопки — <b>под сообщениями</b> (не занимают полэкрана).\n"
                 "Автодайджест: 08:00 и 20:00 МСК.",
-                keyboard=True,
+                markup=INLINE,
             )
-        send(chat_id, "⏳ Собираю…", keyboard=False)
-        send(chat_id, build_digest(True), keyboard=True)
-    elif t in (BTN["short"], "/short") or low == "кратко":
-        send(chat_id, build_digest(False), keyboard=True)
-    elif t in (BTN["weather"], "/weather") or low == "погода":
-        send(chat_id, block_weather(), keyboard=True)
-    elif t in (BTN["rates"], "/rates") or low == "курсы":
-        send(chat_id, block_fx() + "\n\n" + block_metals(), keyboard=True)
-    elif t in (BTN["crypto"], "/crypto") or low == "крипта":
-        send(chat_id, block_crypto(), keyboard=True)
-    elif t in (BTN["kp"], "/kp") or "магн" in low:
-        send(chat_id, block_kp(), keyboard=True)
-    elif t in (BTN["news"], "/news") or low == "новости":
-        send(chat_id, block_news(20), keyboard=True)
-    elif t in (BTN["geo"], "/geo") or "точк" in low:
-        g = resolve_geo()
-        msg = "📍 <b>Геоточка</b>\n"
-        msg += f"{g[2]}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана"
-        send(chat_id, msg, keyboard=True)
+        handle_action(chat_id, "digest")
+    elif t in ("/short",) or low == "кратко":
+        handle_action(chat_id, "short")
+    elif t in ("/weather",) or low == "погода":
+        handle_action(chat_id, "weather")
+    elif t in ("/rates",) or low == "курсы":
+        handle_action(chat_id, "rates")
+    elif t in ("/crypto",) or low == "крипта":
+        handle_action(chat_id, "crypto")
+    elif t in ("/kp",) or "магн" in low:
+        handle_action(chat_id, "kp")
+    elif t in ("/news",) or low == "новости":
+        handle_action(chat_id, "news")
+    elif t in ("/geo",) or "точк" in low:
+        handle_action(chat_id, "geo")
     else:
-        send(chat_id, "Кнопки внизу или /now /weather /rates", keyboard=True)
+        send(chat_id, "Команды: /now /weather /rates — или кнопки ниже 👇", markup=INLINE)
 
 
 def run_live():
     if not BOT_TOKEN:
         raise SystemExit("Нет TELEGRAM_BOT_TOKEN")
-    print("LIVE mode started (Ctrl+C to stop)")
+    print("LIVE mode (inline buttons)")
     try:
         tg("deleteWebhook", json={})
     except Exception as e:
@@ -485,16 +548,28 @@ def run_live():
         try:
             r = SESSION.get(
                 f"{TG}/getUpdates",
-                params={"timeout": 25, "offset": offset},
+                params={
+                    "timeout": 25,
+                    "offset": offset,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                },
                 timeout=(5, 35),
             )
             data = r.json()
             if not data.get("ok"):
-                print("getUpdates bad", data)
+                print("getUpdates", data)
                 time.sleep(2)
                 continue
             for u in data.get("result") or []:
                 offset = u["update_id"] + 1
+                if "callback_query" in u:
+                    cq = u["callback_query"]
+                    cid = cq["message"]["chat"]["id"]
+                    if CHAT_ID and str(cid) != str(CHAT_ID):
+                        continue
+                    answer_cb(cq["id"])
+                    handle_action(cid, cq.get("data") or "")
+                    continue
                 msg = u.get("message") or u.get("edited_message")
                 if not msg:
                     continue
@@ -523,10 +598,10 @@ def main():
     if not BOT_TOKEN or not CHAT_ID:
         print(text[:2000])
         raise SystemExit("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
-    ok = send(CHAT_ID, text, keyboard=True)
-    print("OK" if ok else "FAILED")
-    if not ok:
-        raise SystemExit(1)
+    # убрать старую большую reply-клаву + прислать inline
+    send(CHAT_ID, text, markup=REMOVE_REPLY)
+    send(CHAT_ID, "меню 👇", markup=INLINE)
+    print("OK")
 
 
 if __name__ == "__main__":
