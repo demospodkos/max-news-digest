@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram digest bot — reply-кнопки (сворачиваемые), без зависаний."""
+"""
+Режимы:
+  (по умолчанию) — один дайджест (Actions 08:00/20:00)
+  POLL=1         — обработать нажатия кнопок и выйти (Actions каждые 5 мин)
+  LIVE=1         — необязательный long-poll (если есть свой сервер)
+"""
 
 from __future__ import annotations
 
@@ -23,10 +28,12 @@ GEO_LON = os.environ.get("GEO_LON", "").strip()
 GEO_CITY = os.environ.get("GEO_CITY", "").strip()
 GEO_LABEL = os.environ.get("GEO_LABEL", "").strip()
 LIVE = os.environ.get("LIVE", "").lower() in ("1", "true", "yes")
+POLL = os.environ.get("POLL", "").lower() in ("1", "true", "yes")
 
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 ROOT = Path(__file__).resolve().parent
 GEO_FILE = ROOT / "geo.json"
+OFFSET_FILE = Path(".tg_offset")
 HTTP_TIMEOUT = (1.5, 3.0)
 
 try:
@@ -37,7 +44,7 @@ except Exception:
     TZ = timezone(timedelta(hours=3))
 
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "TgDigestBot/3.4"
+SESSION.headers["User-Agent"] = "TgDigestBot/4.0"
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
 SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
 
@@ -71,20 +78,23 @@ def load_geo():
 
 
 def save_geo(lat: float, lon: float):
-    GEO_FILE.write_text(
-        json.dumps(
-            {
-                "lat": lat,
-                "lon": lon,
-                "label": f"{lat:.4f},{lon:.4f}",
-                "source": "telegram",
-                "updated_at": datetime.now(TZ).isoformat(timespec="seconds"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    try:
+        GEO_FILE.write_text(
+            json.dumps(
+                {
+                    "lat": lat,
+                    "lon": lon,
+                    "label": f"{lat:.4f},{lon:.4f}",
+                    "source": "telegram",
+                    "updated_at": datetime.now(TZ).isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print("save_geo", e)
 
 
 def resolve_geo():
@@ -114,7 +124,7 @@ def resolve_geo():
 def block_weather() -> str:
     geo = resolve_geo()
     if not geo:
-        return "🌤 <b>Погода</b>\nТочка не задана. Нажмите «📍 Гео» или задайте GEO_LAT/GEO_LON"
+        return "🌤 <b>Погода</b>\nТочка не задана. Нажмите «📍 Гео» или Secrets GEO_LAT/GEO_LON"
     lat, lon, label = geo
     try:
         r = get(
@@ -353,7 +363,6 @@ def build_digest(full: bool = True) -> str:
     return "\n\n".join(parts)
 
 
-# Подписи кнопок (должны совпадать с тем, что видит пользователь)
 L_DIGEST = "📊 Дайджест"
 L_SHORT = "⚡ Кратко"
 L_WEATHER = "🌤 Погода"
@@ -374,7 +383,7 @@ KEYBOARD = {
     ],
     "resize_keyboard": True,
     "is_persistent": False,
-    "input_field_placeholder": "Свернуть кнопки: иконка ⌄",
+    "input_field_placeholder": "Свернуть: ⌄ у поля ввода",
 }
 
 
@@ -403,25 +412,20 @@ def send(chat_id, text: str, with_kb: bool = True) -> bool:
             data = post_json(f"{TG}/sendMessage", body).json()
             print("send", data.get("ok"), data.get("description", ""))
             if not data.get("ok"):
-                # fallback без HTML если сломалась разметка
                 body.pop("parse_mode", None)
                 data2 = post_json(f"{TG}/sendMessage", body).json()
-                print("send retry", data2.get("ok"), data2.get("description", ""))
                 if not data2.get("ok"):
                     ok = False
         except Exception as e:
-            print("send err", type(e).__name__, e)
+            print("send err", type(e).__name__)
             ok = False
     return ok
 
 
 def norm(s: str) -> str:
-    """Убрать эмодзи/лишнее — для надёжного сравнения текста кнопок."""
     s = (s or "").strip().lower()
-    # убрать большинство emoji и символов
     s = re.sub(r"[^\w\sа-яё]+", " ", s, flags=re.I)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def on_location(chat_id, lat: float, lon: float):
@@ -429,7 +433,7 @@ def on_location(chat_id, lat: float, lon: float):
     send(
         chat_id,
         f"📍 Точка: <code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n"
-        f"GEO_LAT={lat:.5f} GEO_LON={lon:.5f}\n\n"
+        f"Добавьте в GitHub Secrets:\nGEO_LAT={lat:.5f}\nGEO_LON={lon:.5f}\n\n"
         + block_weather(),
     )
 
@@ -437,126 +441,140 @@ def on_location(chat_id, lat: float, lon: float):
 def on_text(chat_id, text: str):
     raw = (text or "").strip()
     n = norm(raw)
-    print(f"MSG chat={chat_id} raw={raw!r} norm={n!r}")
-
+    print(f"MSG raw={raw!r} norm={n!r}")
     try:
-        if raw in ("/start",):
+        if raw == "/start":
             send(
                 chat_id,
-                "Привет! Кнопки внизу (свернуть — иконка ⌄ у поля ввода).\n"
+                "Кнопки внизу. Ответ на нажатие — обычно до 5 минут\n"
+                "(бот проверяет их через GitHub, без телефона).\n"
                 "Автодайджест: 08:00 и 20:00 МСК.",
             )
             send(chat_id, build_digest(True))
             return
-
-        if (
-            raw in (L_DIGEST, "/now", "/digest")
-            or n in ("дайджест", "digest", "now")
-            or "дайджест" in n
-        ):
+        if raw in (L_DIGEST, "/now", "/digest") or "дайджест" in n or n in ("digest", "now"):
             send(chat_id, build_digest(True))
             return
-
-        if raw in (L_SHORT, "/short") or n in ("кратко", "short") or "кратко" in n:
+        if raw in (L_SHORT, "/short") or "кратко" in n:
             send(chat_id, build_digest(False))
             return
-
-        if raw in (L_WEATHER, "/weather") or n in ("погода", "weather") or "погод" in n:
+        if raw in (L_WEATHER, "/weather") or "погод" in n:
             send(chat_id, block_weather())
             return
-
-        if raw in (L_RATES, "/rates") or n in ("курсы", "rates") or "курс" in n:
+        if raw in (L_RATES, "/rates") or "курс" in n:
             send(chat_id, block_fx() + "\n\n" + block_metals())
             return
-
-        if raw in (L_CRYPTO, "/crypto") or n in ("крипта", "crypto") or "крипт" in n:
+        if raw in (L_CRYPTO, "/crypto") or "крипт" in n:
             send(chat_id, block_crypto())
             return
-
-        if (
-            raw in (L_KP, "/kp")
-            or n in ("магн бури", "бури", "kp")
-            or "магн" in n
-            or n == "бури"
-        ):
+        if raw in (L_KP, "/kp") or "магн" in n or n == "бури":
             send(chat_id, block_kp())
             return
-
-        if raw in (L_NEWS, "/news") or n in ("новости", "news") or "новост" in n:
+        if raw in (L_NEWS, "/news") or "новост" in n:
             send(chat_id, block_news(15))
             return
-
-        if raw in (L_GEO, "/geo") or n in ("точка", "geo") or "точк" in n:
+        if raw in (L_GEO, "/geo") or "точк" in n:
             g = resolve_geo()
             msg = "📍 <b>Геоточка</b>\n"
-            msg += f"{esc(g[2])}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана — нажмите «📍 Гео»"
+            msg += f"{esc(g[2])}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана — «📍 Гео»"
             send(chat_id, msg)
             return
-
-        # неизвестное — всё равно ответить + показать клаву
-        send(chat_id, f"Не понял: {esc(raw)}\nЖмите кнопки внизу или /now")
+        send(chat_id, f"Не понял: {esc(raw)}\nЖмите кнопки внизу.")
     except Exception as e:
-        print("on_text error", type(e).__name__, e)
+        print("on_text", type(e).__name__, e)
         try:
             send(chat_id, f"Ошибка: {type(e).__name__}")
         except Exception:
             pass
 
 
-def run_live():
+def read_offset() -> int:
+    try:
+        if OFFSET_FILE.exists():
+            return int(OFFSET_FILE.read_text().strip() or "0")
+    except Exception:
+        pass
+    return 0
+
+
+def write_offset(off: int) -> None:
+    try:
+        OFFSET_FILE.write_text(str(off))
+    except Exception as e:
+        print("offset write", e)
+
+
+def process_updates(long_poll: bool = False) -> int:
+    """Обработать апдейты. long_poll=False — сразу выйти (для Actions)."""
     if not BOT_TOKEN:
-        raise SystemExit("Нет TELEGRAM_BOT_TOKEN")
-    print("LIVE OK — жду нажатий кнопок")
+        print("no token")
+        return 0
     try:
         post_json(f"{TG}/deleteWebhook", {})
+    except Exception:
+        pass
+
+    offset = read_offset()
+    handled = 0
+    timeout = 20 if long_poll else 0
+    http_to = (3, 30) if long_poll else (2, 8)
+
+    try:
+        r = SESSION.get(
+            f"{TG}/getUpdates",
+            params={"timeout": timeout, "offset": offset},
+            timeout=http_to,
+        )
+        data = r.json()
     except Exception as e:
-        print("deleteWebhook", type(e).__name__)
-    offset = 0
-    last_hb = time.time()
+        print("getUpdates", type(e).__name__, e)
+        return 0
+
+    if not data.get("ok"):
+        print("getUpdates bad", data)
+        return 0
+
+    for u in data.get("result") or []:
+        offset = u["update_id"] + 1
+        msg = u.get("message") or u.get("edited_message")
+        if not msg:
+            continue
+        cid = msg["chat"]["id"]
+        if CHAT_ID and str(cid) != str(CHAT_ID).strip():
+            print("skip", cid)
+            continue
+        if "location" in msg:
+            loc = msg["location"]
+            on_location(cid, float(loc["latitude"]), float(loc["longitude"]))
+            handled += 1
+        elif msg.get("text"):
+            on_text(cid, msg["text"])
+            handled += 1
+
+    write_offset(offset)
+    print(f"processed={handled} offset={offset}")
+    return handled
+
+
+def run_live():
+    print("LIVE long-poll (optional)")
     while True:
         try:
-            if time.time() - last_hb > 45:
-                print(f"hb {datetime.now().strftime('%H:%M:%S')} off={offset}")
-                last_hb = time.time()
-            r = SESSION.get(
-                f"{TG}/getUpdates",
-                params={"timeout": 20, "offset": offset},
-                timeout=(3, 30),
-            )
-            data = r.json()
-            if not data.get("ok"):
-                print("getUpdates", data)
-                time.sleep(2)
-                continue
-            for u in data.get("result") or []:
-                offset = u["update_id"] + 1
-                msg = u.get("message") or u.get("edited_message")
-                if not msg:
-                    continue
-                cid = msg["chat"]["id"]
-                # сравниваем как строки — иначе int/str ломает фильтр
-                if CHAT_ID and str(cid) != str(CHAT_ID).strip():
-                    print(f"skip chat {cid} != {CHAT_ID}")
-                    continue
-                if "location" in msg:
-                    loc = msg["location"]
-                    print(f"LOC {loc}")
-                    on_location(cid, float(loc["latitude"]), float(loc["longitude"]))
-                elif msg.get("text"):
-                    on_text(cid, msg["text"])
-                else:
-                    print("msg keys", list(msg.keys()))
-        except requests.exceptions.ReadTimeout:
-            continue
+            process_updates(long_poll=True)
         except Exception as e:
-            print("loop", type(e).__name__, e)
-            time.sleep(2)
+            print("live", type(e).__name__, e)
+            time.sleep(3)
 
 
 def main():
     if LIVE:
         run_live()
         return
+    if POLL:
+        print("POLL mode — buttons via GitHub Actions")
+        process_updates(long_poll=False)
+        return
+
     print("Building digest…")
     text = build_digest(True)
     print("len", len(text))
