@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Telegram digest bot.
-
-На хостинге (Railway/Render): LIVE=1 — кнопки сразу.
-GitHub Actions digest: без LIVE — один дайджест и выход.
-GitHub poll (опционально): POLL=1 — редко, если нет хостинга.
-"""
+"""Telegram digest bot — нефть, топ-5 крипты, 30+ новостей (РБК и др.)."""
 
 from __future__ import annotations
 
@@ -29,11 +23,8 @@ GEO_LON = os.environ.get("GEO_LON", "").strip()
 GEO_CITY = os.environ.get("GEO_CITY", "").strip()
 GEO_LABEL = os.environ.get("GEO_LABEL", "").strip()
 
-# На Railway/Render обычно задают LIVE=1.
-# Если платформа не передала — но это не Actions digest — тоже можно LIVE.
 LIVE = os.environ.get("LIVE", "").lower() in ("1", "true", "yes")
 POLL = os.environ.get("POLL", "").lower() in ("1", "true", "yes")
-# Авто: если есть PORT или RAILWAY/RENDER — считаем хостингом
 if not LIVE and not POLL:
     if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER") or os.environ.get("FLY_APP_NAME"):
         LIVE = True
@@ -42,7 +33,7 @@ TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 ROOT = Path(__file__).resolve().parent
 GEO_FILE = ROOT / "geo.json"
 OFFSET_FILE = Path(".tg_offset")
-HTTP_TIMEOUT = (1.5, 3.0)
+HTTP_TIMEOUT = (2.0, 5.0)
 
 try:
     from zoneinfo import ZoneInfo
@@ -52,7 +43,9 @@ except Exception:
     TZ = timezone(timedelta(hours=3))
 
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "TgDigestBot/4.1"
+SESSION.headers["User-Agent"] = (
+    "Mozilla/5.0 (compatible; TgDigestBot/4.2; +https://github.com/demospodkos/max-news-digest)"
+)
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
 SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
 
@@ -63,7 +56,7 @@ def get(url: str, **kw):
 
 
 def post_json(url: str, payload: dict):
-    return SESSION.post(url, json=payload, timeout=(2, 10))
+    return SESSION.post(url, json=payload, timeout=(2, 12))
 
 
 def esc(s) -> str:
@@ -218,20 +211,89 @@ def block_fx() -> str:
         return f"💱 Курсы\nошибка: {type(e).__name__}"
 
 
-def block_crypto() -> str:
+def block_oil() -> str:
+    """Нефть Brent (фьючерс BR на MOEX), $/барр."""
     try:
         r = get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin,ethereum", "vs_currencies": "usd,rub"},
+            "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json",
+            params={"iss.meta": "off", "iss.only": "securities,marketdata"},
+        )
+        j = r.json()
+        secs = j.get("securities") or {}
+        md = j.get("marketdata") or {}
+        sc, sd = secs.get("columns") or [], secs.get("data") or []
+        mc, mdt = md.get("columns") or [], md.get("data") or []
+        if not sc or not mc:
+            return "🛢 Нефть\nнет данных"
+        i_sid = sc.index("SECID")
+        i_md_sid = mc.index("SECID")
+        i_last = mc.index("LAST") if "LAST" in mc else None
+        i_chg = mc.index("LASTTOPREVPRICE") if "LASTTOPREVPRICE" in mc else None
+        i_prev = mc.index("PREVSETTLEPRICE") if "PREVSETTLEPRICE" in mc else None
+
+        # ближайшие BR-контракты с ценой
+        prices = []
+        for row in mdt:
+            sid = row[i_md_sid]
+            if not (isinstance(sid, str) and sid.startswith("BR") and len(sid) <= 5):
+                continue
+            last = row[i_last] if i_last is not None else None
+            if last is None:
+                continue
+            chg = row[i_chg] if i_chg is not None else None
+            prices.append((sid, float(last), chg))
+
+        if not prices:
+            return "🛢 Нефть\nнет котировок BR"
+
+        # сортируем по коду (месяц), берём ближайший с ценой
+        prices.sort(key=lambda x: x[0])
+        # чаще ликвиднее ближний месяц — берём 3 с ценой
+        lines = ["🛢 <b>Нефть Brent (MOEX BR)</b>"]
+        for sid, last, chg in prices[:3]:
+            if chg is not None:
+                a = "▲" if chg > 0 else ("▼" if chg < 0 else "•")
+                lines.append(f"{sid}: ${last:.2f} ({a}{abs(chg):.2f}%)")
+            else:
+                lines.append(f"{sid}: ${last:.2f}")
+        lines.append("$/баррель")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"🛢 Нефть\nошибка: {type(e).__name__}"
+
+
+def block_crypto() -> str:
+    """Топ-5 криптовалют по капитализации (CoinGecko)."""
+    try:
+        r = get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 5,
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "24h",
+            },
         )
         if r.status_code == 429:
-            return "₿ Крипта\nлимит API"
-        data = r.json()
-        lines = ["₿ <b>Крипта</b>"]
-        for k, n in (("bitcoin", "BTC"), ("ethereum", "ETH")):
-            if k in data:
-                lines.append(f"{n}: ${data[k].get('usd', 0):,.0f} / {data[k].get('rub', 0):,.0f} ₽")
-        return "\n".join(lines) if len(lines) > 1 else "₿ Крипта\nнет данных"
+            return "₿ Крипта\nлимит API, позже"
+        if r.status_code != 200:
+            return f"₿ Крипта\nHTTP {r.status_code}"
+        rows = r.json()
+        if not rows:
+            return "₿ Крипта\nнет данных"
+        lines = ["₿ <b>Топ-5 крипты</b>"]
+        for i, c in enumerate(rows, 1):
+            sym = (c.get("symbol") or "?").upper()
+            price = c.get("current_price") or 0
+            chg = c.get("price_change_percentage_24h")
+            if chg is not None:
+                a = "▲" if chg > 0 else ("▼" if chg < 0 else "•")
+                lines.append(f"{i}. {sym}: ${price:,.2f} ({a}{abs(chg):.1f}% 24ч)")
+            else:
+                lines.append(f"{i}. {sym}: ${price:,.2f}")
+        return "\n".join(lines)
     except Exception as e:
         return f"₿ Крипта\nошибка: {type(e).__name__}"
 
@@ -295,32 +357,84 @@ def block_stocks() -> str:
         return f"📈 Акции\nошибка: {type(e).__name__}"
 
 
-def block_news(limit: int = 15) -> str:
+def _clean_xml_text(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = html.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _parse_rss_items(text: str, src: str, max_items: int = 12):
+    """title + description для более содержательных новостей."""
+    out = []
+    blocks = re.findall(r"<item(?:\s[^>]*)?>(.*?)</item>", text, re.I | re.S)
+    if not blocks:
+        # fallback: только titles
+        titles = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", text, re.I | re.S)
+        for t in titles[1: max_items + 1]:
+            t = _clean_xml_text(t)
+            if t and t.lower() not in (src.lower(), "новости", "news", "rbc"):
+                out.append((src, t, ""))
+        return out
+
+    for block in blocks[: max_items + 2]:
+        tm = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", block, re.I | re.S)
+        dm = re.search(
+            r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>",
+            block,
+            re.I | re.S,
+        )
+        title = _clean_xml_text(tm.group(1) if tm else "")
+        desc = _clean_xml_text(dm.group(1) if dm else "")
+        if not title or title.lower() in (src.lower(), "новости", "news"):
+            continue
+        # описание не дублирует заголовок
+        if desc and (desc.lower().startswith(title.lower()[:40]) or desc == title):
+            desc = ""
+        if len(desc) > 180:
+            desc = desc[:177].rsplit(" ", 1)[0] + "…"
+        out.append((src, title, desc))
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def block_news(limit: int = 35) -> str:
+    """30+ новостей: РБК, Интерфакс, ТАСС, РИА, BFM, Лента."""
+    feeds = [
+        ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", 12),
+        ("Интерфакс", "https://www.interfax.ru/rss.asp", 10),
+        ("ТАСС", "https://tass.ru/rss/v2.xml", 8),
+        ("РИА", "https://ria.ru/export/rss2/index.xml", 8),
+        ("BFM", "https://www.bfm.ru/news.rss", 8),
+        ("Лента", "https://lenta.ru/rss/news", 8),
+    ]
     items = []
-    for src, url in (("Интерфакс", "https://www.interfax.ru/rss"), ("BFM", "https://www.bfm.ru/news.rss")):
+    for src, url, n in feeds:
         try:
             text = get(url).text
-            titles = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", text, re.I | re.S)
-            for t in titles[1:10]:
-                t = re.sub(r"<[^>]+>", "", t).strip()
-                if t and t.lower() not in (src.lower(), "новости", "news"):
-                    items.append((src, t))
+            items.extend(_parse_rss_items(text, src, n))
         except Exception as e:
             print("rss", src, type(e).__name__)
+
     seen, out = set(), []
-    for src, title in items:
-        k = title.lower()[:70]
+    for src, title, desc in items:
+        k = title.lower()[:80]
         if k in seen:
             continue
         seen.add(k)
-        out.append((src, title))
+        out.append((src, title, desc))
         if len(out) >= limit:
             break
+
     if not out:
         return "📰 Новости\nнет данных"
+
     lines = [f"📰 <b>Новости</b> ({len(out)})"]
-    for i, (src, title) in enumerate(out, 1):
-        lines.append(f"{i}. [{src}] {esc(title)}")
+    for i, (src, title, desc) in enumerate(out, 1):
+        lines.append(f"{i}. <b>[{src}]</b> {esc(title)}")
+        if desc:
+            lines.append(f"   <i>{esc(desc)}</i>")
     return "\n".join(lines)
 
 
@@ -330,6 +444,14 @@ def block_short() -> str:
         v = get("https://www.cbr-xml-daily.ru/daily_json.js").json()["Valute"]
         parts.append(f"USD {v['USD']['Value']:.1f}")
         parts.append(f"EUR {v['EUR']['Value']:.1f}")
+    except Exception:
+        pass
+    try:
+        # краткая нефть
+        oil = block_oil()
+        m = re.search(r"\$(\d+[.,]\d+)", oil)
+        if m:
+            parts.append(f"Brent ${m.group(1)}")
     except Exception:
         pass
     try:
@@ -359,13 +481,14 @@ def build_digest(full: bool = True) -> str:
         _safe(block_weather, "🌤"),
         _safe(block_kp, "🧲"),
         _safe(block_fx, "💱"),
+        _safe(block_oil, "🛢"),
         _safe(block_crypto, "₿"),
     ]
     if full:
         parts += [
             _safe(block_metals, "🥇"),
             _safe(block_stocks, "📈"),
-            _safe(lambda: block_news(15), "📰"),
+            _safe(lambda: block_news(35), "📰"),
         ]
     print(f"digest {time.time()-t0:.1f}s")
     return "\n\n".join(parts)
@@ -441,7 +564,7 @@ def on_location(chat_id, lat: float, lon: float):
     send(
         chat_id,
         f"📍 Точка: <code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n"
-        f"На хосте задайте GEO_LAT={lat:.5f} GEO_LON={lon:.5f}\n\n"
+        f"GEO_LAT={lat:.5f} GEO_LON={lon:.5f}\n\n"
         + block_weather(),
     )
 
@@ -468,8 +591,8 @@ def on_text(chat_id, text: str):
         if raw in (L_WEATHER, "/weather") or "погод" in n:
             send(chat_id, block_weather())
             return
-        if raw in (L_RATES, "/rates") or "курс" in n:
-            send(chat_id, block_fx() + "\n\n" + block_metals())
+        if raw in (L_RATES, "/rates") or "курс" in n or "нефть" in n:
+            send(chat_id, block_fx() + "\n\n" + block_oil() + "\n\n" + block_metals())
             return
         if raw in (L_CRYPTO, "/crypto") or "крипт" in n:
             send(chat_id, block_crypto())
@@ -478,7 +601,7 @@ def on_text(chat_id, text: str):
             send(chat_id, block_kp())
             return
         if raw in (L_NEWS, "/news") or "новост" in n:
-            send(chat_id, block_news(15))
+            send(chat_id, block_news(35))
             return
         if raw in (L_GEO, "/geo") or "точк" in n:
             g = resolve_geo()
@@ -523,7 +646,7 @@ def process_updates(long_poll: bool = False) -> int:
     offset = read_offset()
     handled = 0
     timeout = 25 if long_poll else 0
-    http_to = (5, 35) if long_poll else (2, 8)
+    http_to = (5, 35) if long_poll else (2, 10)
 
     try:
         r = SESSION.get(
@@ -565,7 +688,7 @@ def process_updates(long_poll: bool = False) -> int:
 
 
 def run_live():
-    print("LIVE — кнопки онлайн (как finance-bot)")
+    print("LIVE — кнопки онлайн")
     fail = 0
     while True:
         try:
@@ -590,7 +713,7 @@ def main():
     text = build_digest(True)
     print("len", len(text))
     if not BOT_TOKEN or not CHAT_ID:
-        print(text[:1500])
+        print(text[:2000])
         raise SystemExit("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
     ok = send(CHAT_ID, text, with_kb=True)
     print("OK" if ok else "FAILED")
