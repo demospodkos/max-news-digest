@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram digest bot — нефть, топ-5 крипты, 30+ новостей со ссылками."""
+"""Telegram digest bot — нефть, топ-5 крипты, 30+ новостей (РБК и др.)."""
 
 from __future__ import annotations
 
@@ -37,13 +37,14 @@ HTTP_TIMEOUT = (2.0, 5.0)
 
 try:
     from zoneinfo import ZoneInfo
+
     TZ = ZoneInfo("Europe/Moscow")
 except Exception:
     TZ = timezone(timedelta(hours=3))
 
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = (
-    "Mozilla/5.0 (compatible; TgDigestBot/4.3; +https://github.com/demospodkos/max-news-digest)"
+    "Mozilla/5.0 (compatible; TgDigestBot/4.2; +https://github.com/demospodkos/max-news-digest)"
 )
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
 SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
@@ -211,19 +212,24 @@ def block_fx() -> str:
 
 
 def block_oil() -> str:
+    """Нефть Brent (фьючерс BR на MOEX), $/барр."""
     try:
         r = get(
             "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json",
             params={"iss.meta": "off", "iss.only": "securities,marketdata"},
         )
         j = r.json()
+        secs = j.get("securities") or {}
         md = j.get("marketdata") or {}
+        sc, sd = secs.get("columns") or [], secs.get("data") or []
         mc, mdt = md.get("columns") or [], md.get("data") or []
-        if not mc:
+        if not sc or not mc:
             return "🛢 Нефть\nнет данных"
+        i_sid = sc.index("SECID")
         i_md_sid = mc.index("SECID")
         i_last = mc.index("LAST") if "LAST" in mc else None
         i_chg = mc.index("LASTTOPREVPRICE") if "LASTTOPREVPRICE" in mc else None
+
         prices = []
         for row in mdt:
             sid = row[i_md_sid]
@@ -234,8 +240,10 @@ def block_oil() -> str:
                 continue
             chg = row[i_chg] if i_chg is not None else None
             prices.append((sid, float(last), chg))
+
         if not prices:
             return "🛢 Нефть\nнет котировок BR"
+
         prices.sort(key=lambda x: x[0])
         lines = ["🛢 <b>Нефть Brent (MOEX BR)</b>"]
         for sid, last, chg in prices[:3]:
@@ -251,6 +259,7 @@ def block_oil() -> str:
 
 
 def block_crypto() -> str:
+    """Топ-5 криптовалют по капитализации (CoinGecko)."""
     try:
         r = get(
             "https://api.coingecko.com/api/v3/coins/markets",
@@ -351,30 +360,18 @@ def _clean_xml_text(s: str) -> str:
     return s
 
 
-def _extract_link(block: str) -> str:
-    for pat in (
-        r"<link>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</link>",
-        r"<link[^>]+href=[\"\'](.*?)[\"\']",
-        r"<guid[^>]*>(?:<!\[CDATA\[)?(https?://.*?)(?:\]\]>)?</guid>",
-    ):
-        m = re.search(pat, block, re.I | re.S)
-        if m:
-            link = _clean_xml_text(m.group(1)).split()[0] if m.group(1) else ""
-            if link.startswith("http"):
-                return link
-    return ""
-
-
 def _parse_rss_items(text: str, src: str, max_items: int = 12):
+    """title + description для более содержательных новостей."""
     out = []
     blocks = re.findall(r"<item(?:\s[^>]*)?>(.*?)</item>", text, re.I | re.S)
     if not blocks:
         titles = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", text, re.I | re.S)
-        for t in titles[1 : max_items + 1]:
+        for t in titles[1: max_items + 1]:
             t = _clean_xml_text(t)
             if t and t.lower() not in (src.lower(), "новости", "news", "rbc"):
-                out.append((src, t, "", ""))
+                out.append((src, t, ""))
         return out
+
     for block in blocks[: max_items + 2]:
         tm = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", block, re.I | re.S)
         dm = re.search(
@@ -384,20 +381,20 @@ def _parse_rss_items(text: str, src: str, max_items: int = 12):
         )
         title = _clean_xml_text(tm.group(1) if tm else "")
         desc = _clean_xml_text(dm.group(1) if dm else "")
-        link = _extract_link(block)
         if not title or title.lower() in (src.lower(), "новости", "news"):
             continue
         if desc and (desc.lower().startswith(title.lower()[:40]) or desc == title):
             desc = ""
-        if len(desc) > 160:
-            desc = desc[:157].rsplit(" ", 1)[0] + "…"
-        out.append((src, title, desc, link))
+        if len(desc) > 180:
+            desc = desc[:177].rsplit(" ", 1)[0] + "…"
+        out.append((src, title, desc))
         if len(out) >= max_items:
             break
     return out
 
 
 def block_news(limit: int = 35) -> str:
+    """30+ новостей: РБК, Интерфакс, ТАСС, РИА, BFM, Лента."""
     feeds = [
         ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", 12),
         ("Интерфакс", "https://www.interfax.ru/rss.asp", 10),
@@ -409,31 +406,27 @@ def block_news(limit: int = 35) -> str:
     items = []
     for src, url, n in feeds:
         try:
-            items.extend(_parse_rss_items(get(url).text, src, n))
+            text = get(url).text
+            items.extend(_parse_rss_items(text, src, n))
         except Exception as e:
             print("rss", src, type(e).__name__)
+
     seen, out = set(), []
-    for src, title, desc, link in items:
+    for src, title, desc in items:
         k = title.lower()[:80]
         if k in seen:
             continue
         seen.add(k)
-        out.append((src, title, desc, link))
+        out.append((src, title, desc))
         if len(out) >= limit:
             break
+
     if not out:
         return "📰 Новости\nнет данных"
-    lines = [
-        f"📰 <b>Новости</b> ({len(out)})",
-        "<i>Нажмите на заголовок — откроется полная статья</i>",
-    ]
-    for i, (src, title, desc, link) in enumerate(out, 1):
-        if link:
-            safe_url = link.replace("&", "&amp;").replace('"', "%22")
-            head = f'<a href="{safe_url}">{esc(title)}</a>'
-        else:
-            head = esc(title)
-        lines.append(f"{i}. <b>[{src}]</b> {head}")
+
+    lines = [f"📰 <b>Новости</b> ({len(out)})"]
+    for i, (src, title, desc) in enumerate(out, 1):
+        lines.append(f"{i}. <b>[{src}]</b> {esc(title)}")
         if desc:
             lines.append(f"   <i>{esc(desc)}</i>")
     return "\n".join(lines)
@@ -578,8 +571,7 @@ def on_text(chat_id, text: str):
             send(
                 chat_id,
                 "Бот онлайн. Кнопки отвечают сразу.\n"
-                "Автодайджест (GitHub): 08:00 и 20:00 МСК.\n"
-                "В новостях: нажмите заголовок — откроется статья.",
+                "Автодайджест (GitHub): 08:00 и 20:00 МСК.",
             )
             send(chat_id, build_digest(True))
             return
@@ -643,10 +635,12 @@ def process_updates(long_poll: bool = False) -> int:
         post_json(f"{TG}/deleteWebhook", {})
     except Exception:
         pass
+
     offset = read_offset()
     handled = 0
     timeout = 25 if long_poll else 0
     http_to = (5, 35) if long_poll else (2, 10)
+
     try:
         r = SESSION.get(
             f"{TG}/getUpdates",
@@ -659,9 +653,11 @@ def process_updates(long_poll: bool = False) -> int:
     except Exception as e:
         print("getUpdates", type(e).__name__, e)
         return 0
+
     if not data.get("ok"):
         print("getUpdates bad", data)
         return 0
+
     for u in data.get("result") or []:
         offset = u["update_id"] + 1
         msg = u.get("message") or u.get("edited_message")
@@ -677,6 +673,7 @@ def process_updates(long_poll: bool = False) -> int:
         elif msg.get("text"):
             on_text(cid, msg["text"])
             handled += 1
+
     write_offset(offset)
     if handled:
         print(f"processed={handled} offset={offset}")
@@ -704,6 +701,7 @@ def main():
         print("POLL")
         process_updates(long_poll=False)
         return
+
     print("Building digest…")
     text = build_digest(True)
     print("len", len(text))
