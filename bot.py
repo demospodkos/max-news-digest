@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram digest bot — нефть, топ-5 крипты, 30+ новостей со ссылками."""
+"""Telegram digest: новости открываются текстом внутри бота (кнопки 1…N)."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 ROOT = Path(__file__).resolve().parent
 GEO_FILE = ROOT / "geo.json"
 OFFSET_FILE = Path(".tg_offset")
+NEWS_CACHE = ROOT / "news_cache.json"
 HTTP_TIMEOUT = (2.0, 5.0)
 
 try:
@@ -44,7 +45,7 @@ except Exception:
 
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = (
-    "Mozilla/5.0 (compatible; TgDigestBot/4.3; +https://github.com/demospodkos/max-news-digest)"
+    "Mozilla/5.0 (compatible; TgDigestBot/4.4; +https://github.com/demospodkos/max-news-digest)"
 )
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
 SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
@@ -217,8 +218,7 @@ def block_oil() -> str:
             "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json",
             params={"iss.meta": "off", "iss.only": "securities,marketdata"},
         )
-        j = r.json()
-        md = j.get("marketdata") or {}
+        md = (r.json().get("marketdata") or {})
         mc, mdt = md.get("columns") or [], md.get("data") or []
         if not mc:
             return "🛢 Нефть\nнет данных"
@@ -345,6 +345,7 @@ def block_stocks() -> str:
         return f"📈 Акции\nошибка: {type(e).__name__}"
 
 
+# ── новости: кэш + открытие внутри бота ─────────────────────────────────────
 def _clean_xml_text(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s or "")
     s = html.unescape(s)
@@ -367,15 +368,9 @@ def _extract_link(block: str) -> str:
 
 
 def _parse_rss_items(text: str, src: str, max_items: int = 12):
+    """src, title, teaser, link, body (полный текст из RSS)."""
     out = []
     blocks = re.findall(r"<item(?:\s[^>]*)?>(.*?)</item>", text, re.I | re.S)
-    if not blocks:
-        titles = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", text, re.I | re.S)
-        for t in titles[1 : max_items + 1]:
-            t = _clean_xml_text(t)
-            if t and t.lower() not in (src.lower(), "новости", "news", "rbc"):
-                out.append((src, t, "", ""))
-        return out
     for block in blocks[: max_items + 2]:
         tm = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", block, re.I | re.S)
         dm = re.search(
@@ -383,22 +378,38 @@ def _parse_rss_items(text: str, src: str, max_items: int = 12):
             block,
             re.I | re.S,
         )
+        cm = re.search(
+            r"<content:encoded>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</content:encoded>",
+            block,
+            re.I | re.S,
+        )
+        if not cm:
+            cm = re.search(
+                r"<yandex:full-text>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</yandex:full-text>",
+                block,
+                re.I | re.S,
+            )
         title = _clean_xml_text(tm.group(1) if tm else "")
-        desc = _clean_xml_text(dm.group(1) if dm else "")
+        teaser = _clean_xml_text(dm.group(1) if dm else "")
+        body = _clean_xml_text(cm.group(1) if cm else "")
         link = _extract_link(block)
         if not title or title.lower() in (src.lower(), "новости", "news"):
             continue
-        if desc and (desc.lower().startswith(title.lower()[:40]) or desc == title):
-            desc = ""
-        if len(desc) > 160:
-            desc = desc[:157].rsplit(" ", 1)[0] + "…"
-        out.append((src, title, desc, link))
+        if teaser and (teaser.lower().startswith(title.lower()[:40]) or teaser == title):
+            teaser = ""
+        if not body:
+            body = teaser
+        if len(teaser) > 140:
+            teaser = teaser[:137].rsplit(" ", 1)[0] + "…"
+        out.append(
+            {"src": src, "title": title, "teaser": teaser, "link": link, "body": body or teaser}
+        )
         if len(out) >= max_items:
             break
     return out
 
 
-def block_news(limit: int = 35) -> str:
+def fetch_news_items(limit: int = 35) -> list:
     feeds = [
         ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", 12),
         ("Интерфакс", "https://www.interfax.ru/rss.asp", 10),
@@ -414,30 +425,85 @@ def block_news(limit: int = 35) -> str:
         except Exception as e:
             print("rss", src, type(e).__name__)
     seen, out = set(), []
-    for src, title, desc, link in items:
-        k = title.lower()[:80]
+    for it in items:
+        k = it["title"].lower()[:80]
         if k in seen:
             continue
         seen.add(k)
-        out.append((src, title, desc, link))
+        out.append(it)
         if len(out) >= limit:
             break
-    if not out:
+    return out
+
+
+def save_news_cache(items: list) -> None:
+    try:
+        NEWS_CACHE.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print("news cache", e)
+
+
+def load_news_cache() -> list:
+    try:
+        if NEWS_CACHE.exists():
+            return json.loads(NEWS_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return []
+
+
+def news_inline_keyboard(n: int) -> dict:
+    """Кнопки 1…N — открыть текст новости в боте."""
+    rows, row = [], []
+    for i in range(1, n + 1):
+        row.append({"text": str(i), "callback_data": f"n:{i}"})
+        if len(row) >= 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return {"inline_keyboard": rows}
+
+
+def block_news(limit: int = 35) -> str:
+    items = fetch_news_items(limit)
+    save_news_cache(items)
+    if not items:
         return "📰 Новости\nнет данных"
     lines = [
-        f"📰 <b>Новости</b> ({len(out)})",
-        "<i>Нажмите на заголовок — откроется полная статья</i>",
+        f"📰 <b>Новости</b> ({len(items)})",
+        "<i>Нажмите номер под списком — текст откроется в боте</i>",
     ]
-    for i, (src, title, desc, link) in enumerate(out, 1):
-        if link:
-            safe_url = link.replace("&", "&").replace('"', "%22")
-            head = f'<a href="{safe_url}">{esc(title)}</a>'
-        else:
-            head = esc(title)
-        lines.append(f"{i}. <b>[{src}]</b> {head}")
-        if desc:
-            lines.append(f"   <i>{esc(desc)}</i>")
+    for i, it in enumerate(items, 1):
+        lines.append(f"{i}. <b>[{esc(it['src'])}]</b> {esc(it['title'])}")
+        if it.get("teaser"):
+            lines.append(f"   <i>{esc(it['teaser'])}</i>")
     return "\n".join(lines)
+
+
+def open_news_in_bot(chat_id, num: int) -> None:
+    """Показать полный текст новости прямо в чате."""
+    items = load_news_cache()
+    if not items:
+        items = fetch_news_items(35)
+        save_news_cache(items)
+    if num < 1 or num > len(items):
+        send(chat_id, f"Нет новости №{num}. Сначала «📰 Новости» или дайджест.")
+        return
+    it = items[num - 1]
+    body = (it.get("body") or it.get("teaser") or "").strip()
+    if len(body) < 80 and it.get("link"):
+        # попробовать чуть расширить: повторно взять teaser из кэша
+        body = body or "Краткое описание недоступно."
+    text = (
+        f"📰 <b>[{esc(it['src'])}]</b>\n"
+        f"<b>{esc(it['title'])}</b>\n\n"
+        f"{esc(body)}"
+    )
+    if it.get("link"):
+        # ссылка только как доп.строка, основной текст уже в боте
+        text += f"\n\n<i>Источник:</i> {esc(it['link'])}"
+    send(chat_id, text, with_kb=True)
 
 
 def block_short() -> str:
@@ -519,7 +585,7 @@ KEYBOARD = {
 }
 
 
-def send(chat_id, text: str, with_kb: bool = True) -> bool:
+def send(chat_id, text: str, with_kb: bool = True, inline=None) -> bool:
     chunks = []
     while text:
         if len(text) <= 3900:
@@ -538,8 +604,11 @@ def send(chat_id, text: str, with_kb: bool = True) -> bool:
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        if with_kb and i == len(chunks) - 1:
-            body["reply_markup"] = KEYBOARD
+        if i == len(chunks) - 1:
+            if inline is not None:
+                body["reply_markup"] = inline
+            elif with_kb:
+                body["reply_markup"] = KEYBOARD
         try:
             data = post_json(f"{TG}/sendMessage", body).json()
             print("send", data.get("ok"), data.get("description", ""))
@@ -554,6 +623,21 @@ def send(chat_id, text: str, with_kb: bool = True) -> bool:
     return ok
 
 
+def send_news_block(chat_id) -> None:
+    text = block_news(35)
+    items = load_news_cache()
+    n = len(items)
+    send(chat_id, text, with_kb=False)
+    if n:
+        send(
+            chat_id,
+            f"Открыть в боте — нажмите номер (1–{n}):",
+            with_kb=False,
+            inline=news_inline_keyboard(n),
+        )
+        send(chat_id, "⌘", with_kb=True)  # вернуть reply-клаву
+
+
 def norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^\w\sа-яё]+", " ", s, flags=re.I)
@@ -564,9 +648,7 @@ def on_location(chat_id, lat: float, lon: float):
     save_geo(lat, lon)
     send(
         chat_id,
-        f"📍 Точка: <code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n"
-        f"GEO_LAT={lat:.5f} GEO_LON={lon:.5f}\n\n"
-        + block_weather(),
+        f"📍 Точка: <code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n\n" + block_weather(),
     )
 
 
@@ -574,18 +656,40 @@ def on_text(chat_id, text: str):
     raw = (text or "").strip()
     n = norm(raw)
     print(f"MSG raw={raw!r} norm={n!r}")
+
+    # номер новости: «12» или «/12»
+    m = re.fullmatch(r"/?(\d{1,2})", raw)
+    if m:
+        open_news_in_bot(chat_id, int(m.group(1)))
+        return
+
     try:
         if raw == "/start":
             send(
                 chat_id,
-                "Бот онлайн. Кнопки отвечают сразу.\n"
-                "Автодайджест (GitHub): 08:00 и 20:00 МСК.\n"
-                "В новостях: нажмите заголовок — откроется статья.",
+                "Бот онлайн.\n"
+                "📰 Новости → список → нажмите <b>номер</b> — текст откроется здесь, в боте.",
             )
             send(chat_id, build_digest(True))
+            items = load_news_cache()
+            if items:
+                send(
+                    chat_id,
+                    f"Открыть новость в боте (1–{len(items)}):",
+                    with_kb=False,
+                    inline=news_inline_keyboard(len(items)),
+                )
             return
-        if raw in (L_DIGEST, "/now", "/digest") or "дайджест" in n or n in ("digest", "now"):
+        if raw in (L_DIGEST, "/now", "/digest") or "дайджест" in n:
             send(chat_id, build_digest(True))
+            items = load_news_cache()
+            if items:
+                send(
+                    chat_id,
+                    f"Открыть новость в боте (1–{len(items)}):",
+                    with_kb=False,
+                    inline=news_inline_keyboard(len(items)),
+                )
             return
         if raw in (L_SHORT, "/short") or "кратко" in n:
             send(chat_id, build_digest(False))
@@ -603,7 +707,7 @@ def on_text(chat_id, text: str):
             send(chat_id, block_kp())
             return
         if raw in (L_NEWS, "/news") or "новост" in n:
-            send(chat_id, block_news(35))
+            send_news_block(chat_id)
             return
         if raw in (L_GEO, "/geo") or "точк" in n:
             g = resolve_geo()
@@ -611,13 +715,33 @@ def on_text(chat_id, text: str):
             msg += f"{esc(g[2])}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана — «📍 Гео»"
             send(chat_id, msg)
             return
-        send(chat_id, f"Не понял: {esc(raw)}\nЖмите кнопки внизу.")
+        send(chat_id, f"Не понял: {esc(raw)}\nЖмите кнопки или номер новости (1, 2, 3…).")
     except Exception as e:
         print("on_text", type(e).__name__, e)
         try:
             send(chat_id, f"Ошибка: {type(e).__name__}")
         except Exception:
             pass
+
+
+def answer_callback(cb_id: str, text: str = "") -> None:
+    try:
+        post_json(
+            f"{TG}/answerCallbackQuery",
+            {"callback_query_id": cb_id, "text": (text or "")[:180]},
+        )
+    except Exception as e:
+        print("cb", e)
+
+
+def on_callback(chat_id, data: str, cb_id: str) -> None:
+    answer_callback(cb_id)
+    if data.startswith("n:"):
+        try:
+            num = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        open_news_in_bot(chat_id, num)
 
 
 def read_offset() -> int:
@@ -651,7 +775,11 @@ def process_updates(long_poll: bool = False) -> int:
     try:
         r = SESSION.get(
             f"{TG}/getUpdates",
-            params={"timeout": timeout, "offset": offset},
+            params={
+                "timeout": timeout,
+                "offset": offset,
+                "allowed_updates": json.dumps(["message", "callback_query"]),
+            },
             timeout=http_to,
         )
         data = r.json()
@@ -665,6 +793,15 @@ def process_updates(long_poll: bool = False) -> int:
         return 0
     for u in data.get("result") or []:
         offset = u["update_id"] + 1
+        if "callback_query" in u:
+            cq = u["callback_query"]
+            msg = cq.get("message") or {}
+            cid = (msg.get("chat") or {}).get("id") or (cq.get("from") or {}).get("id")
+            if CHAT_ID and str(cid) != str(CHAT_ID).strip():
+                continue
+            on_callback(cid, cq.get("data") or "", cq.get("id") or "")
+            handled += 1
+            continue
         msg = u.get("message") or u.get("edited_message")
         if not msg:
             continue
@@ -685,7 +822,7 @@ def process_updates(long_poll: bool = False) -> int:
 
 
 def run_live():
-    print("LIVE — кнопки онлайн")
+    print("LIVE — новости открываются в боте")
     fail = 0
     while True:
         try:
@@ -711,10 +848,16 @@ def main():
     if not BOT_TOKEN or not CHAT_ID:
         print(text[:2000])
         raise SystemExit("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
-    ok = send(CHAT_ID, text, with_kb=True)
-    print("OK" if ok else "FAILED")
-    if not ok:
-        raise SystemExit(1)
+    send(CHAT_ID, text, with_kb=True)
+    items = load_news_cache()
+    if items:
+        send(
+            CHAT_ID,
+            f"Открыть новость <b>в боте</b> — нажмите номер (1–{len(items)}):",
+            with_kb=False,
+            inline=news_inline_keyboard(len(items)),
+        )
+    print("OK")
 
 
 if __name__ == "__main__":
