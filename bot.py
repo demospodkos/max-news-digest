@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram digest: новости открываются текстом внутри бота (кнопки 1…N)."""
+"""Новости: нажал на заголовок (кнопка) → полный текст сразу в чате."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ except Exception:
 
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = (
-    "Mozilla/5.0 (compatible; TgDigestBot/4.4; +https://github.com/demospodkos/max-news-digest)"
+    "Mozilla/5.0 (compatible; TgDigestBot/4.5; +https://github.com/demospodkos/max-news-digest)"
 )
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
 SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
@@ -218,7 +218,7 @@ def block_oil() -> str:
             "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json",
             params={"iss.meta": "off", "iss.only": "securities,marketdata"},
         )
-        md = (r.json().get("marketdata") or {})
+        md = r.json().get("marketdata") or {}
         mc, mdt = md.get("columns") or [], md.get("data") or []
         if not mc:
             return "🛢 Нефть\nнет данных"
@@ -265,7 +265,7 @@ def block_crypto() -> str:
             },
         )
         if r.status_code == 429:
-            return "₿ Крипта\nлимит API, позже"
+            return "₿ Крипта\nлимит API"
         if r.status_code != 200:
             return f"₿ Крипта\nHTTP {r.status_code}"
         rows = r.json()
@@ -345,12 +345,10 @@ def block_stocks() -> str:
         return f"📈 Акции\nошибка: {type(e).__name__}"
 
 
-# ── новости: кэш + открытие внутри бота ─────────────────────────────────────
 def _clean_xml_text(s: str) -> str:
     s = re.sub(r"<[^>]+>", " ", s or "")
     s = html.unescape(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _extract_link(block: str) -> str:
@@ -368,15 +366,12 @@ def _extract_link(block: str) -> str:
 
 
 def _parse_rss_items(text: str, src: str, max_items: int = 12):
-    """src, title, teaser, link, body (полный текст из RSS)."""
     out = []
     blocks = re.findall(r"<item(?:\s[^>]*)?>(.*?)</item>", text, re.I | re.S)
     for block in blocks[: max_items + 2]:
         tm = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", block, re.I | re.S)
         dm = re.search(
-            r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>",
-            block,
-            re.I | re.S,
+            r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>", block, re.I | re.S
         )
         cm = re.search(
             r"<content:encoded>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</content:encoded>",
@@ -399,24 +394,28 @@ def _parse_rss_items(text: str, src: str, max_items: int = 12):
             teaser = ""
         if not body:
             body = teaser
-        if len(teaser) > 140:
-            teaser = teaser[:137].rsplit(" ", 1)[0] + "…"
         out.append(
-            {"src": src, "title": title, "teaser": teaser, "link": link, "body": body or teaser}
+            {
+                "src": src,
+                "title": title,
+                "teaser": teaser[:200] if teaser else "",
+                "link": link,
+                "body": body or teaser or title,
+            }
         )
         if len(out) >= max_items:
             break
     return out
 
 
-def fetch_news_items(limit: int = 35) -> list:
+def fetch_news_items(limit: int = 30) -> list:
     feeds = [
-        ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", 12),
-        ("Интерфакс", "https://www.interfax.ru/rss.asp", 10),
-        ("ТАСС", "https://tass.ru/rss/v2.xml", 8),
-        ("РИА", "https://ria.ru/export/rss2/index.xml", 8),
-        ("BFM", "https://www.bfm.ru/news.rss", 8),
-        ("Лента", "https://lenta.ru/rss/news", 8),
+        ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", 10),
+        ("Интерфакс", "https://www.interfax.ru/rss.asp", 8),
+        ("ТАСС", "https://tass.ru/rss/v2.xml", 6),
+        ("РИА", "https://ria.ru/export/rss2/index.xml", 6),
+        ("BFM", "https://www.bfm.ru/news.rss", 6),
+        ("Лента", "https://lenta.ru/rss/news", 6),
     ]
     items = []
     for src, url, n in feeds:
@@ -452,58 +451,62 @@ def load_news_cache() -> list:
     return []
 
 
-def news_inline_keyboard(n: int) -> dict:
-    """Кнопки 1…N — открыть текст новости в боте."""
-    rows, row = [], []
-    for i in range(1, n + 1):
-        row.append({"text": str(i), "callback_data": f"n:{i}"})
-        if len(row) >= 5:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+def _btn_label(src: str, title: str) -> str:
+    """Текст кнопки = сама новость (лимит Telegram 64 символа)."""
+    t = f"[{src}] {title}"
+    if len(t) <= 64:
+        return t
+    return t[:61] + "…"
+
+
+def news_title_keyboard(items: list) -> dict:
+    """Каждая новость — кнопка с заголовком. Нажал → текст в чате."""
+    rows = []
+    for i, it in enumerate(items, 1):
+        rows.append(
+            [{"text": _btn_label(it["src"], it["title"]), "callback_data": f"n:{i}"}]
+        )
     return {"inline_keyboard": rows}
 
 
-def block_news(limit: int = 35) -> str:
+def block_news_text(limit: int = 30) -> str:
+    """Короткий заголовок блока (сами новости — кнопки)."""
     items = fetch_news_items(limit)
     save_news_cache(items)
     if not items:
         return "📰 Новости\nнет данных"
-    lines = [
-        f"📰 <b>Новости</b> ({len(items)})",
-        "<i>Нажмите номер под списком — текст откроется в боте</i>",
-    ]
-    for i, it in enumerate(items, 1):
-        lines.append(f"{i}. <b>[{esc(it['src'])}]</b> {esc(it['title'])}")
-        if it.get("teaser"):
-            lines.append(f"   <i>{esc(it['teaser'])}</i>")
-    return "\n".join(lines)
+    return (
+        f"📰 <b>Новости</b> ({len(items)})\n"
+        f"<i>Нажмите на заголовок ниже — текст откроется в этом чате</i>"
+    )
 
 
 def open_news_in_bot(chat_id, num: int) -> None:
-    """Показать полный текст новости прямо в чате."""
     items = load_news_cache()
     if not items:
-        items = fetch_news_items(35)
+        items = fetch_news_items(30)
         save_news_cache(items)
     if num < 1 or num > len(items):
-        send(chat_id, f"Нет новости №{num}. Сначала «📰 Новости» или дайджест.")
+        send(chat_id, f"Нет новости №{num}. Снова откройте «📰 Новости».")
         return
     it = items[num - 1]
-    body = (it.get("body") or it.get("teaser") or "").strip()
-    if len(body) < 80 and it.get("link"):
-        # попробовать чуть расширить: повторно взять teaser из кэша
-        body = body or "Краткое описание недоступно."
+    body = (it.get("body") or it.get("teaser") or "").strip() or "Текст недоступен в ленте."
     text = (
         f"📰 <b>[{esc(it['src'])}]</b>\n"
         f"<b>{esc(it['title'])}</b>\n\n"
         f"{esc(body)}"
     )
-    if it.get("link"):
-        # ссылка только как доп.строка, основной текст уже в боте
-        text += f"\n\n<i>Источник:</i> {esc(it['link'])}"
     send(chat_id, text, with_kb=True)
+
+
+def send_news_block(chat_id) -> None:
+    intro = block_news_text(30)
+    items = load_news_cache()
+    if not items:
+        send(chat_id, intro)
+        return
+    # одно сообщение: подсказка + кнопки-заголовки
+    send(chat_id, intro, with_kb=False, inline=news_title_keyboard(items))
 
 
 def block_short() -> str:
@@ -555,7 +558,6 @@ def build_digest(full: bool = True) -> str:
         parts += [
             _safe(block_metals, "🥇"),
             _safe(block_stocks, "📈"),
-            _safe(lambda: block_news(35), "📰"),
         ]
     print(f"digest {time.time()-t0:.1f}s")
     return "\n\n".join(parts)
@@ -623,21 +625,6 @@ def send(chat_id, text: str, with_kb: bool = True, inline=None) -> bool:
     return ok
 
 
-def send_news_block(chat_id) -> None:
-    text = block_news(35)
-    items = load_news_cache()
-    n = len(items)
-    send(chat_id, text, with_kb=False)
-    if n:
-        send(
-            chat_id,
-            f"Открыть в боте — нажмите номер (1–{n}):",
-            with_kb=False,
-            inline=news_inline_keyboard(n),
-        )
-        send(chat_id, "⌘", with_kb=True)  # вернуть reply-клаву
-
-
 def norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^\w\sа-яё]+", " ", s, flags=re.I)
@@ -646,50 +633,26 @@ def norm(s: str) -> str:
 
 def on_location(chat_id, lat: float, lon: float):
     save_geo(lat, lon)
-    send(
-        chat_id,
-        f"📍 Точка: <code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n\n" + block_weather(),
-    )
+    send(chat_id, f"📍 Точка: <code>{lat:.5f}</code>, <code>{lon:.5f}</code>\n\n" + block_weather())
 
 
 def on_text(chat_id, text: str):
     raw = (text or "").strip()
     n = norm(raw)
-    print(f"MSG raw={raw!r} norm={n!r}")
-
-    # номер новости: «12» или «/12»
-    m = re.fullmatch(r"/?(\d{1,2})", raw)
-    if m:
-        open_news_in_bot(chat_id, int(m.group(1)))
-        return
-
+    print(f"MSG raw={raw!r}")
     try:
         if raw == "/start":
             send(
                 chat_id,
                 "Бот онлайн.\n"
-                "📰 Новости → список → нажмите <b>номер</b> — текст откроется здесь, в боте.",
+                "📰 Новости — нажмите на заголовок, текст откроется в чате.",
             )
             send(chat_id, build_digest(True))
-            items = load_news_cache()
-            if items:
-                send(
-                    chat_id,
-                    f"Открыть новость в боте (1–{len(items)}):",
-                    with_kb=False,
-                    inline=news_inline_keyboard(len(items)),
-                )
+            send_news_block(chat_id)
             return
         if raw in (L_DIGEST, "/now", "/digest") or "дайджест" in n:
             send(chat_id, build_digest(True))
-            items = load_news_cache()
-            if items:
-                send(
-                    chat_id,
-                    f"Открыть новость в боте (1–{len(items)}):",
-                    with_kb=False,
-                    inline=news_inline_keyboard(len(items)),
-                )
+            send_news_block(chat_id)
             return
         if raw in (L_SHORT, "/short") or "кратко" in n:
             send(chat_id, build_digest(False))
@@ -715,7 +678,7 @@ def on_text(chat_id, text: str):
             msg += f"{esc(g[2])}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана — «📍 Гео»"
             send(chat_id, msg)
             return
-        send(chat_id, f"Не понял: {esc(raw)}\nЖмите кнопки или номер новости (1, 2, 3…).")
+        send(chat_id, f"Не понял: {esc(raw)}\nЖмите кнопки внизу.")
     except Exception as e:
         print("on_text", type(e).__name__, e)
         try:
@@ -724,12 +687,9 @@ def on_text(chat_id, text: str):
             pass
 
 
-def answer_callback(cb_id: str, text: str = "") -> None:
+def answer_callback(cb_id: str) -> None:
     try:
-        post_json(
-            f"{TG}/answerCallbackQuery",
-            {"callback_query_id": cb_id, "text": (text or "")[:180]},
-        )
+        post_json(f"{TG}/answerCallbackQuery", {"callback_query_id": cb_id})
     except Exception as e:
         print("cb", e)
 
@@ -738,10 +698,9 @@ def on_callback(chat_id, data: str, cb_id: str) -> None:
     answer_callback(cb_id)
     if data.startswith("n:"):
         try:
-            num = int(data.split(":", 1)[1])
+            open_news_in_bot(chat_id, int(data.split(":", 1)[1]))
         except ValueError:
-            return
-        open_news_in_bot(chat_id, num)
+            pass
 
 
 def read_offset() -> int:
@@ -762,7 +721,6 @@ def write_offset(off: int) -> None:
 
 def process_updates(long_poll: bool = False) -> int:
     if not BOT_TOKEN:
-        print("no token")
         return 0
     try:
         post_json(f"{TG}/deleteWebhook", {})
@@ -822,7 +780,7 @@ def process_updates(long_poll: bool = False) -> int:
 
 
 def run_live():
-    print("LIVE — новости открываются в боте")
+    print("LIVE — нажал заголовок → текст в чате")
     fail = 0
     while True:
         try:
@@ -839,24 +797,15 @@ def main():
         run_live()
         return
     if POLL:
-        print("POLL")
         process_updates(long_poll=False)
         return
     print("Building digest…")
     text = build_digest(True)
-    print("len", len(text))
     if not BOT_TOKEN or not CHAT_ID:
-        print(text[:2000])
+        print(text[:1500])
         raise SystemExit("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
     send(CHAT_ID, text, with_kb=True)
-    items = load_news_cache()
-    if items:
-        send(
-            CHAT_ID,
-            f"Открыть новость <b>в боте</b> — нажмите номер (1–{len(items)}):",
-            with_kb=False,
-            inline=news_inline_keyboard(len(items)),
-        )
+    send_news_block(CHAT_ID)
     print("OK")
 
 
