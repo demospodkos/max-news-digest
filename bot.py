@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Telegram digest bot v5."""
+"""Telegram digest bot v5.1 — дайджест новостей, курсов, погоды и рынков."""
 from __future__ import annotations
 import html, json, os, re, time
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -23,17 +23,31 @@ if not LIVE and not POLL:
         LIVE = True
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 ROOT = Path(__file__).resolve().parent
-GEO_FILE = ROOT / "geo.json"
-OFFSET_FILE = Path(".tg_offset")
-PREFS_FILE = ROOT / "prefs.json"
+# DATA_DIR — куда писать prefs/geo/offset. На хостингах с эфемерной файловой системой
+# (Render free и т.п.) укажите путь к постоянному диску, иначе настройки сбросятся при рестарте.
+_DATA_DIR = os.environ.get("DATA_DIR", "").strip()
+DATA_DIR = Path(_DATA_DIR) if _DATA_DIR else ROOT
+GEO_FILE = DATA_DIR / "geo.json"
+OFFSET_FILE = (DATA_DIR / ".tg_offset") if _DATA_DIR else Path(".tg_offset")
+PREFS_FILE = DATA_DIR / "prefs.json"
+EVENTS_FILE = DATA_DIR / "events.json"
 HTTP_TIMEOUT = (2.0, 6.0)
 CACHE_TTL = 600
 _CACHE: dict = {}
+TZ_NAME = os.environ.get("BOT_TZ", "").strip() or "Europe/Moscow"
 try:
     from zoneinfo import ZoneInfo
-    TZ = ZoneInfo("Europe/Moscow")
+    TZ = ZoneInfo(TZ_NAME)
 except Exception:
+    TZ_NAME = "Europe/Moscow"
     TZ = timezone(timedelta(hours=3))
+TZ_LABEL = "МСК" if TZ_NAME == "Europe/Moscow" else TZ_NAME
+
+
+def redact(s) -> str:
+    """Убирает токен бота из текста (исключения requests содержат полный URL с токеном)."""
+    text = str(s)
+    return text.replace(BOT_TOKEN, "<token>") if BOT_TOKEN else text
 SESSION = requests.Session()
 SESSION.headers["User-Agent"] = "Mozilla/5.0 (compatible; TgDigestBot/5.0)"
 SESSION.mount("https://", HTTPAdapter(max_retries=Retry(total=0)))
@@ -41,6 +55,16 @@ SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=0)))
 CITIES = {"Москва": (55.7558, 37.6173), "СПб": (59.9343, 30.3351), "Новосибирск": (55.0084, 82.9357), "Екатеринбург": (56.8389, 60.6057), "Казань": (55.7961, 49.1064), "Краснодар": (45.0355, 38.9753), "Владивосток": (43.1155, 131.8855)}
 TOP_KW = ("цб", "ставка", "нефть", "санкц", "курс", "доллар", "евро", "газ", "опек", "федрезерв", "фрс", "инфляц", "рубл", "бирж", "акци", "крипт", "биткоин", "войн", "перемир", "нато", "трамп", "путин", "правительств")
 EVENTS_2026 = [("2026-10-24", "Заседание ЦБ РФ (ключевая ставка)"), ("2026-11-07", "Заседание ЦБ РФ (ориентир)"), ("2026-12-19", "Заседание ЦБ РФ (ориентир)"), ("2026-10-29", "Заседание ФРС (ориентир)"), ("2026-12-10", "Заседание ФРС (ориентир)"), ("2026-11-27", "Thanksgiving — рынки США закрыты"), ("2026-12-25", "Рождество — рынки США/EU закрыты"), ("2026-01-01", "Новый год — рынки закрыты"), ("2026-01-07", "Рождество (РФ) — выходной"), ("2026-02-23", "День защитника Отечества"), ("2026-03-08", "8 Марта"), ("2026-05-01", "Праздник Весны и Труда"), ("2026-05-09", "День Победы"), ("2026-06-12", "День России"), ("2026-11-04", "День народного единства")]
+
+def load_events() -> list:
+    """События календаря: events.json ([["2026-10-24", "Название"], ...]) или встроенный список."""
+    try:
+        if EVENTS_FILE.exists():
+            rows = json.loads(EVENTS_FILE.read_text(encoding="utf-8"))
+            out = [(str(r[0]), str(r[1])) for r in rows if len(r) >= 2]
+            if out: return out
+    except Exception as e: print("events", type(e).__name__)
+    return EVENTS_2026
 
 def get(url: str, **kw):
     kw.setdefault("timeout", HTTP_TIMEOUT)
@@ -119,7 +143,7 @@ def block_weather() -> str:
     cached = cache_get(ck)
     if cached: return cached
     try:
-        r = get("https://api.open-meteo.com/v1/forecast", params={"latitude": lat, "longitude": lon, "current": "temperature_2m,apparent_temperature,wind_speed_10m,wind_gusts_10m,wind_direction_10m,weather_code,relative_humidity_2m", "daily": "sunrise,sunset", "timezone": "Europe/Moscow", "forecast_days": 1})
+        r = get("https://api.open-meteo.com/v1/forecast", params={"latitude": lat, "longitude": lon, "current": "temperature_2m,apparent_temperature,wind_speed_10m,wind_gusts_10m,wind_direction_10m,weather_code,relative_humidity_2m", "daily": "sunrise,sunset", "timezone": TZ_NAME, "forecast_days": 1})
         if r.status_code != 200: return f"🌤 Погода\nHTTP {r.status_code}"
         data = r.json(); c = data.get("current") or {}; d = data.get("daily") or {}
         codes = {0: "ясно", 1: "почти ясно", 2: "облачно", 3: "пасмурно", 45: "туман", 61: "дождь", 71: "снег", 73: "снег", 75: "сильный снег", 80: "ливень", 85: "снегопад", 95: "гроза"}
@@ -169,7 +193,7 @@ def block_macro() -> str:
         if not rows: return "🏛 Макро\nставка ЦБ: нет данных"
         date, rate = rows[0]; rate = rate.replace(",", ".")
         next_cbr = None; today = datetime.now(TZ).date()
-        for ds, title in EVENTS_2026:
+        for ds, title in sorted(load_events(), key=lambda x: x[0]):
             if "ЦБ" in title:
                 try:
                     d = datetime.strptime(ds, "%Y-%m-%d").date()
@@ -313,7 +337,7 @@ def block_stocks() -> str:
     except Exception as e: return f"📈 Акции\nошибка: {type(e).__name__}"
 def block_calendar() -> str:
     today = datetime.now(TZ).date(); upcoming = []
-    for ds, title in sorted(EVENTS_2026, key=lambda x: x[0]):
+    for ds, title in sorted(load_events(), key=lambda x: x[0]):
         try: d = datetime.strptime(ds, "%Y-%m-%d").date()
         except Exception: continue
         if d < today or d > today + timedelta(days=45): continue
@@ -379,7 +403,7 @@ def block_news(limit: int = 35, category: str | None = None) -> str:
     for i, (src, title, desc, link) in enumerate(ordered, 1):
         star = "★ " if _norm_title(title) in top_titles else ""
         if link:
-            safe = link.replace("&", "&").replace('"', "%22"); head = f'<a href="{safe}">{esc(title)}</a>'
+            safe = link.replace("&", "&amp;").replace('"', "%22"); head = f'<a href="{safe}">{esc(title)}</a>'
         else: head = esc(title)
         lines.append(f"{i}. {star}<b>[{src}]</b> {head}")
         if desc: lines.append(f"   <i>{esc(desc)}</i>")
@@ -434,7 +458,7 @@ def build_digest(full: bool | None = None) -> str:
     prefs = load_prefs()
     if full is None: full = not prefs.get("prefer_short", False)
     t0 = time.time()
-    parts = [f"{'📊' if full else '⚡'} <b>Дайджест {now_str()}</b> МСК", _safe(block_short, "⚡")]
+    parts = [f"{'📊' if full else '⚡'} <b>Дайджест {now_str()}</b> {esc(TZ_LABEL)}", _safe(block_short, "⚡")]
     if not full:
         print(f"digest short {time.time()-t0:.1f}s"); return "\n\n".join(parts)
     parts += [_safe(block_weather, "🌤"), _safe(block_kp, "🧲"), _safe(block_macro, "🏛"), _safe(block_fx, "💱"), _safe(block_oil, "🛢"), _safe(block_indices, "📉"), _safe(block_crypto, "₿"), _safe(block_metals, "🥇"), _safe(block_stocks, "📈"), _safe(block_calendar, "📅"), _safe(lambda: block_news(35), "📰")]
@@ -476,7 +500,7 @@ def settings_help() -> str:
     p = load_prefs()
     return ("⚙️ <b>Настройки</b>\n\n" f"Тикеры: <code>{', '.join(p.get('tickers') or [])}</code>\n" f"Монеты: <code>{', '.join(p.get('coins') or [])}</code>\n" f"Краткий по умолчанию: {'да' if p.get('prefer_short') else 'нет'}\n" f"Тихие часы: {p.get('quiet_start') or '—'}–{p.get('quiet_end') or '—'}\n" f"Категория новостей: {p.get('news_cat') or 'all'}\n\n" "<b>Команды:</b>\n/tickers SBER GAZP YNDX\n/coins bitcoin ethereum solana\n/short_on | /short_off\n/quiet 22:00 07:00 | /quiet off\n/news_cat all|polit|econ|tech|world\n/hide · /menu")
 def on_text(chat_id, text: str):
-    raw = (text or "").strip(); n = norm(raw); print(f"MSG raw={raw!r}")
+    raw = (text or "").strip(); n = norm(raw); print(f"MSG len={len(raw)}")
     for name, (lat, lon) in CITIES.items():
         if raw == name or n == name.lower():
             save_geo(lat, lon, name); send(chat_id, f"🏙 Город: {esc(name)}\n\n" + block_weather()); return
@@ -533,7 +557,7 @@ def on_text(chat_id, text: str):
             g = resolve_geo(); msg = "📍 <b>Геоточка</b>\n"; msg += f"{esc(g[2])}: {g[0]:.4f}, {g[1]:.4f}" if g else "не задана — «📍 Гео» или «🏙 Город»"; send(chat_id, msg); return
         send(chat_id, f"Не понял: {esc(raw)}\nЖмите кнопки или /settings")
     except Exception as e:
-        print("on_text", type(e).__name__, e)
+        print("on_text", type(e).__name__, redact(e))
         try: send(chat_id, f"Ошибка: {type(e).__name__}")
         except Exception: pass
 def read_offset() -> int:
@@ -554,8 +578,8 @@ def process_updates(long_poll: bool = False) -> int:
         r = SESSION.get(f"{TG}/getUpdates", params={"timeout": timeout, "offset": offset}, timeout=http_to)
         data = r.json()
     except requests.exceptions.ReadTimeout: return 0
-    except Exception as e: print("getUpdates", type(e).__name__, e); return 0
-    if not data.get("ok"): print("getUpdates bad", data); return 0
+    except Exception as e: print("getUpdates", type(e).__name__, redact(e)); return 0
+    if not data.get("ok"): print("getUpdates bad", redact(data)); return 0
     for u in data.get("result") or []:
         offset = u["update_id"] + 1
         msg = u.get("message") or u.get("edited_message")
@@ -574,7 +598,7 @@ def run_live():
     while True:
         try: process_updates(long_poll=True); fail = 0
         except Exception as e:
-            fail += 1; print("live", type(e).__name__, e); time.sleep(min(30, 2 * fail))
+            fail += 1; print("live", type(e).__name__, redact(e)); time.sleep(min(30, 2 * fail))
 def main():
     if LIVE: run_live(); return
     if POLL: process_updates(long_poll=False); return
